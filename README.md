@@ -17,7 +17,7 @@
 
 ## 构建与测试
 
-需要 Node.js 24.15.0 或更高版本。Git 跟踪源码和锁文件；依赖、编译输出、本地插件包和工作区索引留在本机。
+需要 Node.js 24.15.0 或更高版本。`main` 分支保存源码和锁文件；`release` 分支同时保存预构建插件。工作区索引只保留在本机。
 
 ```bash
 npm ci --ignore-scripts        # 从锁文件安装，不运行原生 grammar 安装脚本
@@ -45,9 +45,56 @@ node dist/cli.mjs doctor   --root <path>
 node dist/cli.mjs query    <name> --root <path> [--input F]
 ```
 
-## 本地安装
+## 安装
 
-`npm run pack:plugin` 生成自包含的 `plugins/code-map/` 与 `dist/code-map-<版本>.zip`，内含供 Codex 发现 Hook 的兼容清单。仓库根 `.agents/plugins/marketplace.json` 以 `./plugins/code-map` 为本地来源。在桌面端刷新或重启后安装，审核并信任 Hook，再开启新会话验证 `use-code-map` 和 `code-map-init`。从 v0.1 升级时，移除另行配置的 Code Map MCP 服务器，以免其工具继续进入模型上下文。
+支持以下两种方式，任选其一。当前优先验收 Windows。两种方式均需要：
+
+- Git。
+- Node.js 24.15.0 或更高版本；`node` 必须在终端和 Codex 的 PATH 中可用。
+- 支持 `codex plugin` 命令和插件 Hook 的 Codex 桌面环境。可先运行 `codex plugin --help` 检查命令。
+
+```text
+main 源码 → 本机构建、校验、打包 → 本地 marketplace → 安装
+release 预构建插件 → GitHub marketplace → 安装
+```
+
+### 方式一：从源码构建
+
+在 PowerShell 中依次运行：
+
+```powershell
+git clone --branch main --single-branch https://github.com/kangkang196/code_map.git
+cd code_map
+
+npm ci --ignore-scripts
+npm run build
+npm run validate:plugin
+npm run pack:plugin
+
+codex plugin marketplace add .
+codex plugin add code-map@code-map-dev
+```
+
+打包生成自包含的 `plugins/code-map/`、`dist/code-map-<版本>.zip` 及 SHA-256 校验文件。本地安装读取仓库根 `.agents/plugins/marketplace.json`，从 `./plugins/code-map` 安装。运行安装命令时须保持在该仓库目录。源码分支不包含此生成目录，必须先完成构建和打包。
+
+### 方式二：从 GitHub 发行分支安装
+
+`release` 分支包含完整的预构建插件、运行依赖、WASM、Skill 和 Hook。无需克隆源码、编译或运行 `npm install`。在任意目录运行：
+
+```powershell
+codex plugin marketplace add kangkang196/code_map --ref release
+codex plugin add code-map@code-map-dev
+```
+
+第一条命令添加 GitHub 发行来源；第二条安装插件。两种安装方式的 marketplace 名均为 `code-map-dev`。如果要切换来源，先运行 `codex plugin marketplace remove code-map-dev`，再按目标方式添加来源和安装。
+
+### 安装后检查
+
+1. 运行 `codex plugin list --marketplace code-map-dev`，确认 Code Map 已安装。
+2. 刷新或重启 Codex 桌面端，审核并信任当前 Hook 定义。仅安装插件不会自动信任 Hook。
+3. 在目标代码项目中新建会话，检查 `use-code-map` 和 `code-map-init` 可用。显式调用 `$code-map:code-map-init` 或从 `/` 菜单选择 `code-map-init`，才会首次建图；安装插件不会自动扫描项目。
+
+默认安装只注册两个 Skill 与生命周期 Hook。后台隔离维护仍需要宿主适配器，验证边界见 [维护验收记录](docs/index-maintenance-acceptance.md)。从 v0.1 升级时，移除另行配置的 Code Map MCP 服务器，以免重复注册。
 
 从源码独立测试 stdio MCP 时，使用 `node dist/server.mjs`。
 
