@@ -1,0 +1,29 @@
+{
+  "name": "code-map",
+  "version": "0.4.0",
+  "description": "Code navigation for coding agents: browse cluster/file/highlight semantics and trace source-backed static relations and multi-hop paths. TypeScript/JavaScript and Python; Windows first.",
+  "author": {
+    "name": "Code Map"
+  },
+  "license": "MIT",
+  "keywords": [
+    "code",
+    "navigation",
+    "code-map",
+    "typescript",
+    "python"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Code Map",
+    "shortDescription": "Cluster/file/highlight code navigation with source-backed relations and paths.",
+    "longDescription": "The use-code-map skill queries verified facts and explicit semantic review states. Default queries refresh enabled indexes. PostToolUse synchronizes recognized source edits. Stop registers background review work; an owning host adapter is required for isolated Agent execution. Manual maintenance remains available.",
+    "developerName": "Code Map",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg"
+  }
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "code-map-init"
+  short_description: "Explicitly build or resume the Code Map index for a workspace."
+
+policy:
+  allow_implicit_invocation: false
