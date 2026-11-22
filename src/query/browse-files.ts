@@ -86,7 +86,7 @@ export function mapBrowseFiles(input: BrowseFilesInput, prepared?: import('./pro
         const keys = (input.file_ids ?? input.paths ?? []).map((k) => (input.paths ? normalizeQueryPath(k) : k));
         if (keys.length < 1 || keys.length > BATCH_LIMIT) throw new QueryError('INVALID_ARGUMENT', `batch size must be 1-${BATCH_LIMIT}`, 2);
         const byId = !!input.file_ids;
-        const cursorCtx = { workspaceId: v.workspace_id, generation: v.generation, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['browse', byId ? 'ids' : 'paths', keys]) };
+        const cursorCtx = { workspaceId: v.workspace_id, physical_revision: v.physical_revision, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['browse', byId ? 'ids' : 'paths', keys]) };
         const offset = resolveCursorOffset(input.cursor, cursorCtx);
         // Order-preserving dedup.
         const seen = new Set<string>();
@@ -107,7 +107,7 @@ export function mapBrowseFiles(input: BrowseFilesInput, prepared?: import('./pro
       }
 
       const scope = directoryScope(ctx, input.scope_path ?? '.');
-      const cursorCtx = { workspaceId: v.workspace_id, generation: v.generation, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['browse', 'scope', scope]) };
+      const cursorCtx = { workspaceId: v.workspace_id, physical_revision: v.physical_revision, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['browse', 'scope', scope]) };
       const offset = resolveCursorOffset(input.cursor, cursorCtx);
       const prefix = scope === '.' ? '' : `${scope}/`;
       const fileIds = ctx.db.all<{ file_id: string }>('SELECT file_id FROM files WHERE substr(path, 1, length(?)) = ? ORDER BY path', prefix, prefix);

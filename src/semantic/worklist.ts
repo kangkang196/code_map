@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Database } from '../storage/database.js';
+import { PROTOCOL_VERSION } from '../storage/database.js';
 import { readWorkspaceState } from '../index/build.js';
 import { semanticSnapshot, type Semantics, type TargetKind } from './baseline.js';
 import { submissionBase } from './base.js';
@@ -15,13 +16,13 @@ export interface Review {
   locations?: Location[];
 }
 export interface Worklist {
-  schema_version: 2;
+  schema_version: typeof PROTOCOL_VERSION;
   workspace_id: string;
   worklist_id: string;
   base: string;
   session_id?: string;
   turn_id?: string;
-  base_generation: number;
+  base_physical_revision: number;
   base_semantic_revision: number;
   reviews: Review[];
   unassigned_files: { id: string; location: Location }[];
@@ -52,10 +53,10 @@ export function prepareWorklist(db: Database, opts: { scope?: string[]; sessionI
   }
   const unassigned = db.all<{ id: string; path: string }>(`SELECT f.file_id AS id, f.path FROM files f LEFT JOIN clusters c ON c.cluster_id = f.cluster_id
     WHERE f.cluster_id IS NULL OR c.cluster_type = 'pending' ORDER BY f.path`);
-  const worklist: Worklist = { schema_version: 2, workspace_id: ws.workspace_id, worklist_id: worklistId,
+  const worklist: Worklist = { schema_version: PROTOCOL_VERSION, workspace_id: ws.workspace_id, worklist_id: worklistId,
     base: submissionBase(ws, opts.sessionId ? worklistId : undefined),
     ...(opts.sessionId ? { session_id: opts.sessionId, turn_id: opts.turnId ?? '' } : {}),
-    base_generation: ws.generation, base_semantic_revision: ws.semantic_revision, reviews,
+    base_physical_revision: ws.physical_revision, base_semantic_revision: ws.semantic_revision, reviews,
     unassigned_files: unassigned.filter((f) => !scope || scope.has(f.id)).map((f) => ({ id: f.id, location: { path: f.path } })), candidates: [] };
   if (opts.sessionId && (reviews.length || unassigned.length)) {
     const accepted = new Map(db.all<{ kind: string; id: string; fingerprint: string }>('SELECT kind, id, fingerprint FROM semantic_baselines').map((r) => [`${r.kind}:${r.id}`, r.fingerprint]));
@@ -68,8 +69,8 @@ export function prepareWorklist(db: Database, opts: { scope?: string[]; sessionI
     for (const o of snapshot.values()) if (o.kind === 'cluster' && allowed.has(`cluster:${o.id}`)) {
       for (const f of db.all<{ file_id: string }>('SELECT file_id FROM files WHERE cluster_id = ?', o.id)) includeFile(f.file_id);
     }
-    db.run(`INSERT INTO semantic_tasks (worklist_id, session_id, turn_id, generation, semantic_revision, state, route, worklist, allowed, updated_at)
-      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`, worklistId, opts.sessionId, opts.turnId ?? '', ws.generation, ws.semantic_revision,
+    db.run(`INSERT INTO semantic_tasks (worklist_id, session_id, turn_id, physical_revision, semantic_revision, state, route, worklist, allowed, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`, worklistId, opts.sessionId, opts.turnId ?? '', ws.physical_revision, ws.semantic_revision,
       opts.route ?? 'background', JSON.stringify(worklist), JSON.stringify([...allowed]), Date.now());
   }
   return worklist;

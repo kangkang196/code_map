@@ -10,7 +10,8 @@ import { loadConfig, configPath, openWorkspace, closeWorkspace, ConfigError, typ
 import { configFingerprint, discover, type DiscoveryConfig, type Manifest } from './workspace/discovery.js';
 import { canonicalRoot, dirName, PathError } from './workspace/paths.js';
 import { readState, writeState } from './workspace/lifecycle.js';
-import type { Database } from './storage/database.js';
+import { SCHEMA_VERSION, type Database } from './storage/database.js';
+import { parseBase } from './semantic/base.js';
 import { LeaseConflict } from './storage/lease.js';
 import type { SyncMode } from './index/sync.js';
 import { lastCycleSummary, maintenanceStatus } from './semantic/status.js';
@@ -33,9 +34,6 @@ class CliError extends Error {
 interface Flags {
   root?: string;
   dryRun: boolean;
-  next: boolean;
-  submit: boolean;
-  publish: boolean;
   prepare: boolean;
   apply: boolean;
   resume: boolean;
@@ -47,9 +45,9 @@ interface Flags {
 
 function parseArgs(argv: string[]): { command: string; flags: Flags } {
   const command = argv[0] ?? '';
-  const flags: Flags = { dryRun: false, next: false, submit: false, publish: false, prepare: false, apply: false, resume: false, rebuild: false, scope: [] };
+  const flags: Flags = { dryRun: false, prepare: false, apply: false, resume: false, rebuild: false, scope: [] };
   const commandFlags = {
-    init: ['--dry-run', '--next', '--submit', '--publish', '--input'],
+    init: ['--dry-run'],
     sync: ['--resume', '--rebuild'],
     annotate: ['--prepare', '--apply', '--scope', '--input', '--base'],
     query: ['--input'],
@@ -71,9 +69,6 @@ function parseArgs(argv: string[]): { command: string; flags: Flags } {
       case '--input': flags.input = value(arg, ++i); break;
       case '--scope': flags.scope.push(value(arg, ++i)); break;
       case '--dry-run': flags.dryRun = true; break;
-      case '--next': flags.next = true; break;
-      case '--submit': flags.submit = true; break;
-      case '--publish': flags.publish = true; break;
       case '--prepare': flags.prepare = true; break;
       case '--apply': flags.apply = true; break;
       case '--resume': flags.resume = true; break;
@@ -81,7 +76,7 @@ function parseArgs(argv: string[]): { command: string; flags: Flags } {
       default: throw new CliError('INVALID_ARGUMENT', `unknown argument: ${arg}`, 2);
     }
   }
-  if (command !== 'query' && Boolean(flags.input) !== (flags.submit || flags.apply)) throw new CliError('INVALID_ARGUMENT', '--input is required for --submit or --apply', 2);
+  if (command !== 'query' && Boolean(flags.input) !== flags.apply) throw new CliError('INVALID_ARGUMENT', '--input is required for --apply', 2);
   if (flags.scope.length && !flags.prepare) throw new CliError('INVALID_ARGUMENT', '--scope requires --prepare', 2);
   return { command, flags };
 }
@@ -91,12 +86,12 @@ function requireRoot(flags: Flags): string {
   return flags.root;
 }
 
-function decodeInput(bytes: Buffer): string {
-  if (bytes.length > 64 * 1024 || !isUtf8(bytes)) throw new CliError('INVALID_INPUT', 'input must be UTF-8 and at most 64 KiB');
+function decodeInput(bytes: Buffer, maxBytes: number): string {
+  if (bytes.length > maxBytes || !isUtf8(bytes)) throw new CliError('INVALID_INPUT', `input must be UTF-8 and at most ${maxBytes} bytes`);
   return bytes.toString('utf8').replace(/^\uFEFF/, '');
 }
 
-function readInput(flags: Flags): string {
+function readInput(flags: Flags, maxBytes = 64 * 1024): string {
   if (!flags.input) throw new CliError('INVALID_ARGUMENT', '--input FILE is required', 2);
   if (flags.input === '-') {
     const chunks: Buffer[] = [];
@@ -106,15 +101,15 @@ function readInput(flags: Flags): string {
       const read = readSync(0, buffer);
       if (!read) break;
       size += read;
-      if (size > 64 * 1024) throw new CliError('INVALID_INPUT', 'input exceeds 64 KiB');
+      if (size > maxBytes) throw new CliError('INVALID_INPUT', `input exceeds ${maxBytes} bytes`);
       chunks.push(buffer.subarray(0, read));
     }
-    return decodeInput(Buffer.concat(chunks));
+    return decodeInput(Buffer.concat(chunks), maxBytes);
   }
   if (!existsSync(flags.input)) throw new CliError('INPUT_NOT_FOUND', `input file not found: ${flags.input}`, 2);
   const stat = statSync(flags.input);
-  if (!stat.isFile() || stat.size > 64 * 1024) throw new CliError('INVALID_INPUT', '--input must be a file of at most 64 KiB', 2);
-  return decodeInput(readFileSync(flags.input));
+  if (!stat.isFile() || stat.size > maxBytes) throw new CliError('INVALID_INPUT', `--input must be a file of at most ${maxBytes} bytes`, 2);
+  return decodeInput(readFileSync(flags.input), maxBytes);
 }
 
 function rejectMultipleModes(flags: Flags, modes: [string, boolean][]): void {
@@ -133,76 +128,33 @@ function log(message: string): void {
 async function runInit(flags: Flags): Promise<number> {
   const root = canonicalRoot(requireRoot(flags));
   const config = loadConfig(root);
-  rejectMultipleModes(flags, [['--dry-run', flags.dryRun], ['--next', flags.next], ['--submit', flags.submit], ['--publish', flags.publish]]);
-  const { BuildError, buildFacts, initializeWorkspace, openBuildEnvironment, previewBuild, readWorkspaceState, newBootstrapId } = await import('./index/build.js');
-
+  const { BuildError, buildFacts, initializeWorkspace, previewBuild, readWorkspaceState } = await import('./index/build.js');
+  const manifest = await previewBuild(root, config);
   if (flags.dryRun) {
-    const manifest = await previewBuild(root, config);
     emit(previewReport(root, manifest, config));
     return 0;
   }
-
-  const state = readState(root);
-  const continuation = flags.next || flags.submit || flags.publish;
-  if (continuation && !state?.enabled) {
-    throw new CliError(state ? 'INDEX_SUSPENDED' : 'NOT_ENABLED', 'run init before continuing the build', 3);
-  }
-  const manifest = continuation ? undefined : await previewBuild(root, config);
-  if (manifest && manifest.files.length === 0) throw new BuildError('NO_SOURCE_FILES', 'no included source files found', 3);
-  const env = continuation && state
-    ? openBuildEnvironment(root)
-    : initializeWorkspace(root, config, configFingerprint(config));
+  if (!manifest.files.length) throw new BuildError('NO_SOURCE_FILES', 'no included source files found', 3);
+  const env = initializeWorkspace(root, config, configFingerprint(config));
   try {
-    const { startBootstrap, nextBatch, submitBatch, publish } = await import('./index/bootstrap.js');
-    if (flags.next) {
-      const result = nextBatch(env.db, env.root);
-      emit(result.phase === 'done' ? { phase: 'done' } : result.envelope);
-      return 0;
-    }
-    if (flags.submit) {
-      const res = submitBatch(env.db, readInput(flags));
-      emit({ ok: true, ...res });
-      return 0;
-    }
-    if (flags.publish) {
-      const ws = readWorkspaceState(env.db);
-      const report = publish(env.db, { workspaceId: env.state.workspace_id, root: env.root, config });
-      log(`published generation=${report.generation}`);
-      emit({ ok: true, workspace_id: ws?.workspace_id ?? env.state.workspace_id, ...report });
-      return 0;
-    }
     const existing = readWorkspaceState(env.db);
-    if (existing && existing.build_status === 'ready') {
-      emit({ ok: true, already_ready: true, workspace_id: env.state.workspace_id, generation: existing.generation, semantic_revision: existing.semantic_revision, hint: 'use sync to update or sync --rebuild to reconstruct' });
+    if (existing?.build_status === 'ready') {
+      emit({ ok: true, already_ready: true, workspace_id: env.state.workspace_id, physical_revision: existing.physical_revision,
+        semantic_revision: existing.semantic_revision, hint: 'use sync to update or sync --rebuild to reconstruct' });
       return 0;
     }
-    const bootstrapId = newBootstrapId();
-    const build = await buildFacts(env, {
-      manifest,
-      stage: (snapshot) => startBootstrap(env.db, {
-        bootstrapId,
-        manifestHash: snapshot.manifestHash,
-        configFingerprint: env.configFingerprint,
-        adapterFingerprint: env.adapterFingerprint,
-        root: env.root,
-        files: snapshot.files,
-      }),
-    });
-    log(`staged ${build.manifest.files.length} files; facts parsed (nodes=${build.counts.nodeCount}, edges=${build.counts.edgeCount})`);
-    emit({
-      ok: true,
-      workspace_id: env.state.workspace_id,
-      bootstrap_id: bootstrapId,
-      build_status: 'building',
-      generation: 0,
-      manifest: manifestSummary(build.manifest),
-      facts: build.counts,
-      next: 'codemap init --root <path> --next',
-    });
+    const { startBootstrap, writeInitialTask } = await import('./index/bootstrap.js');
+    if (existing) {
+      const { syncWorkspace } = await import('./index/sync.js');
+      await syncWorkspace(env, 'resume');
+    } else {
+      await buildFacts(env, { manifest, stage: () => { startBootstrap(env.db); } });
+    }
+    const task = writeInitialTask(env.db, root);
+    emit({ ok: true, workspace_id: env.state.workspace_id, build_status: 'building', physical_revision: 0, semantic_revision: 0,
+      manifest: manifestSummary(manifest), ...task });
     return 0;
-  } finally {
-    env.db.close();
-  }
+  } finally { env.db.close(); }
 }
 
 function previewReport(root: string, manifest: Manifest, config: DiscoveryConfig): unknown {
@@ -252,8 +204,9 @@ async function runSync(flags: Flags): Promise<number> {
   const env = openBuildEnvironment(root);
   try {
     const result = await syncWorkspace(env, mode);
-    log(`${result.status}: generation=${result.generation} added=${result.added} changed=${result.changed} removed=${result.removed} workItems=${result.workItems}`);
-    emit({ ok: true, ...result });
+    log(`${result.status}: physical_revision=${result.physical_revision} added=${result.added} changed=${result.changed} removed=${result.removed} workItems=${result.workItems}`);
+    const task = flags.resume ? (await import('./index/bootstrap.js')).writeInitialTask(env.db, root) : {};
+    emit({ ok: true, ...result, ...task });
     return 0;
   } finally {
     env.db.close();
@@ -280,7 +233,7 @@ async function runAnnotate(flags: Flags): Promise<number> {
   try {
     if (ws.lifecycle.state === 'suspended') throw new CliError('INDEX_SUSPENDED', 'workspace is suspended; run init to resume', 3);
     const db = ws.db;
-    if (!db || ws.lifecycle.state !== 'ready') throw new CliError('INDEX_NOT_READY', 'no published index; run init', 3);
+    if (!db || (ws.lifecycle.state !== 'ready' && !(flags.apply && ws.lifecycle.state === 'building'))) throw new CliError('INDEX_NOT_READY', 'run init to prepare an index snapshot', 3);
     const { readWorkspaceState } = await import('./index/build.js');
     const verifyManifest = () => {
       const version = readWorkspaceState(db);
@@ -297,7 +250,11 @@ async function runAnnotate(flags: Flags): Promise<number> {
       return 0;
     }
     const { applyPatch } = await import('./semantic/apply.js');
-    const result = applyPatch(db, readInput(flags), flags.base!);
+    const { PATCH_MAX_BYTES, INITIAL_MAX_BYTES } = await import('./semantic/submission.js');
+    let maxBytes = PATCH_MAX_BYTES;
+    try { if (parseBase(flags.base!).bootstrap_id) maxBytes = INITIAL_MAX_BYTES; }
+    catch { throw new CliError('INVALID_BASE', 'use the original base returned with the task or query'); }
+    const result = applyPatch(db, readInput(flags, maxBytes), flags.base!);
     log(result.already_applied ? 'patch already applied (idempotent)' : `applied; semantic_revision=${result.semantic_revision}`);
     emit({ ok: true, ...result });
     return 0;
@@ -340,15 +297,15 @@ async function runDoctor(flags: Flags): Promise<number> {
       root,
       lifecycle: ws.lifecycle.state,
       workspace_id: ws.lifecycle.workspaceId,
-      generation: ws.lifecycle.generation,
+      physical_revision: ws.lifecycle.physical_revision,
       semantic_revision: ws.lifecycle.semanticRevision,
       build_status: ws.lifecycle.buildStatus,
       runtime: { node: process.version, platform: process.platform, arch: process.arch },
       database: { present: !!ws.db, integrity: integrity?.integrity_check ?? 'n/a' },
       coverage: ws.db ? coverageOf(ws.db) : null,
-      bootstrap_in_progress: bootstrap ? { bootstrap_id: bootstrap.bootstrap_id, phase: bootstrap.phase } : null,
+      bootstrap_in_progress: bootstrap,
       maintenance: Object.fromEntries(maintenance.map((m) => [m.status, Number(m.n)])),
-      automatic_maintenance: ws.db && ws.db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value === '2'
+      automatic_maintenance: ws.db && ws.db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value === String(SCHEMA_VERSION)
         ? {
             hooks: 'shipped',
             ...maintenanceStatus(ws.db),
@@ -423,15 +380,9 @@ async function describeError(err: unknown, command: string | undefined): Promise
   try {
     const { BuildError } = await import('./index/build.js');
     if (err instanceof BuildError) return { code: err.code, exitCode: err.exitCode };
-    const { BootstrapError } = await import('./index/bootstrap.js');
-    if (err instanceof BootstrapError) {
-      const invalid = ['SCHEMA_INVALID', 'INVALID_JSON', 'UNKNOWN_CHUNK', 'UNKNOWN_FILE', 'UNKNOWN_CLUSTER', 'UNKNOWN_BATCH', 'INVALID_BATCH_ITEMS', 'INVALID_PHASE', 'BOOTSTRAP_MISMATCH', 'SUBMIT_TOO_LARGE'];
-      const exitCode = err.code === 'BATCH_CONFLICT' ? 5 : invalid.includes(err.code) ? 2 : 3;
-      return { code: err.code, exitCode, fields: err.field ? [err.field] : undefined };
-    }
     const { ApplyError } = await import('./semantic/apply.js');
     if (err instanceof ApplyError) {
-      const invalid = ['SCHEMA_INVALID', 'INVALID_JSON', 'INVALID_INPUT', 'INVALID_BASE', 'NOT_FOUND', 'WORKSPACE_MISMATCH', 'UNKNOWN_WORKLIST', 'INVALID_LOCATION', 'TARGET_OUT_OF_SCOPE', 'DUPLICATE_TARGET', 'UNKNOWN_CLUSTER'];
+      const invalid = ['SCHEMA_INVALID', 'INVALID_JSON', 'INVALID_INPUT', 'INVALID_BASE', 'NOT_FOUND', 'WORKSPACE_MISMATCH', 'UNKNOWN_WORKLIST', 'INVALID_LOCATION', 'TARGET_OUT_OF_SCOPE', 'DUPLICATE_TARGET', 'UNKNOWN_CLUSTER', 'INVALID_HIGHLIGHT'];
       const exitCode = ['VERSION_CONFLICT', 'BATCH_CONFLICT'].includes(err.code) ? 5 : invalid.includes(err.code) ? 2 : 3;
       return { code: err.code, exitCode, fields: err.fields };
     }

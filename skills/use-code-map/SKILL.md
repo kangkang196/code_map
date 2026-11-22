@@ -26,7 +26,7 @@ Choose the entry the task needs. The layers are knowledge views, not a required 
 Pass query fields other than root as UTF-8 JSON. `--input -` accepts standard input.
 Read source from returned locations and make your own Reading Plan.
 
-Every response uses schema 2 and binds `workspace_id`, `physical_index.generation`,
+Every response uses schema 3 and binds `workspace_id`, `physical_index.physical_revision`,
 `semantic_revision` and `base`. `physical_index.status: "valid"` means the included source and
 configuration matched the index at verification. Object `semantics.status` separately reports
 `reviewed`, `needs_review`, `missing` or `not_selected`. Preserve that distinction.

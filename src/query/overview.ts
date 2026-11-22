@@ -51,7 +51,7 @@ export function mapOverview(input: OverviewInput, prepared?: import('./protocol.
       const v = ctx.version();
       const cursorCtx = {
         workspaceId: v.workspace_id,
-        generation: v.generation,
+        physical_revision: v.physical_revision,
         semanticRevision: v.semantic_revision,
         fingerprint: inputFingerprint(['overview', input.cluster_id ?? null, input.scope_path ?? null]),
       };

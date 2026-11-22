@@ -1,4 +1,4 @@
-// SQLite storage adapter: schema 2, WAL, foreign keys, busy timeout and read snapshots.
+// SQLite storage adapter: schema 3, WAL, foreign keys, busy timeout and read snapshots.
 // All transactional behaviour (facts, semantics, cluster assignment, lease fencing) is
 // funnelled through here so the CLI, MCP server and hooks share one update path.
 
@@ -8,8 +8,8 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { acquireLease, assertLeaseValid, releaseLease } from './lease.js';
 
-export const SCHEMA_VERSION = 2;
-export const PROTOCOL_VERSION = 2;
+export const SCHEMA_VERSION = 3;
+export const PROTOCOL_VERSION = 3;
 
 /**
  * IDs, paths, hashes and descriptions are TEXT; coordinates, versions and
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS workspace_state (
   workspace_id       TEXT PRIMARY KEY,
   root_path          TEXT NOT NULL,
   schema_version     INTEGER NOT NULL,
-  generation         INTEGER NOT NULL DEFAULT 0,
+  physical_revision         INTEGER NOT NULL DEFAULT 0,
   semantic_revision  INTEGER NOT NULL DEFAULT 0,
   build_status       TEXT NOT NULL DEFAULT 'inactive',
   manifest_hash      TEXT,
@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS maintenance (
   change_kind          TEXT NOT NULL,
   status               TEXT NOT NULL DEFAULT 'open',
   idempotency_key      TEXT,
-  base_generation      INTEGER,
+  base_physical_revision      INTEGER,
   base_semantic_revision INTEGER,
   payload              TEXT,
   created_at           INTEGER NOT NULL DEFAULT 0,
@@ -167,57 +167,6 @@ CREATE TABLE IF NOT EXISTS write_lease (
   owner_nonce    TEXT NOT NULL,
   fencing_token  INTEGER NOT NULL,
   expires_at     INTEGER NOT NULL
-);
-
--- Staging tables for the two-phase bootstrap; cleared on publish.
-CREATE TABLE IF NOT EXISTS bootstrap_state (
-  bootstrap_id   TEXT PRIMARY KEY,
-  manifest_hash  TEXT NOT NULL,
-  phase          TEXT NOT NULL DEFAULT 'read',
-  config_fingerprint TEXT,
-  adapter_fingerprint TEXT,
-  created_at     INTEGER NOT NULL DEFAULT 0,
-  updated_at     INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS bootstrap_manifest (
-  path        TEXT PRIMARY KEY,
-  file_hash   TEXT NOT NULL,
-  language    TEXT NOT NULL,
-  byte_size   INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS bootstrap_chunks (
-  chunk_id    TEXT PRIMARY KEY,
-  path        TEXT NOT NULL,
-  file_hash   TEXT NOT NULL,
-  start_byte  INTEGER NOT NULL,
-  end_byte    INTEGER NOT NULL,
-  start_line  INTEGER NOT NULL,
-  received    INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS bootstrap_file_drafts (
-  path             TEXT PRIMARY KEY,
-  file_hash        TEXT NOT NULL,
-  purpose          TEXT,
-  important        INTEGER NOT NULL DEFAULT 0,
-  content          TEXT,
-  purpose_source   TEXT,
-  content_source   TEXT,
-  highlights       TEXT,
-  complete         INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS bootstrap_cluster_drafts (
-  key         TEXT PRIMARY KEY,
-  name        TEXT NOT NULL,
-  purpose     TEXT
-);
-
-CREATE TABLE IF NOT EXISTS bootstrap_assignments (
-  path        TEXT PRIMARY KEY,
-  cluster_key TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS semantic_baselines (
@@ -232,7 +181,7 @@ CREATE TABLE IF NOT EXISTS semantic_tasks (
   worklist_id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
   turn_id TEXT NOT NULL,
-  generation INTEGER NOT NULL,
+  physical_revision INTEGER NOT NULL,
   semantic_revision INTEGER NOT NULL,
   state TEXT NOT NULL,
   route TEXT NOT NULL,
@@ -240,7 +189,7 @@ CREATE TABLE IF NOT EXISTS semantic_tasks (
   worklist TEXT NOT NULL,
   allowed TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
-  UNIQUE(session_id, turn_id, generation, semantic_revision)
+  UNIQUE(session_id, turn_id, physical_revision, semantic_revision)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_running_task ON semantic_tasks ((1)) WHERE state IN ('running','awaiting_result');
 
@@ -300,21 +249,36 @@ export class Database {
     const previous = hasMeta ? Number(this.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value ?? 1) : 0;
     if (previous > SCHEMA_VERSION) throw new Error(`unsupported index schema: ${previous}`);
     if (previous === SCHEMA_VERSION) return;
-    const lease = previous === 1 ? acquireLease(this) : null;
+    const lease = previous > 0 ? acquireLease(this) : null;
     try {
-      if (previous === 1) {
-        // VACUUM produces a consistent backup including committed WAL pages.
-        this.db.prepare('VACUUM INTO ?').run(`${this.db.location()}.schema-1-${randomUUID()}.bak`);
+      if (previous > 0) {
+        // Preserve committed WAL pages before changing a user's existing index.
+        this.db.prepare('VACUUM INTO ?').run(`${this.db.location()}.schema-${previous}-${randomUUID()}.bak`);
       }
       this.transaction(() => {
         if (lease) assertLeaseValid(this, lease);
         if (hasMeta && this.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value === String(SCHEMA_VERSION)) return;
-        this.db.exec(DDL);
-        if (previous === 1) {
-          this.db.exec('ALTER TABLE files ADD COLUMN important INTEGER NOT NULL DEFAULT 0');
-          this.db.exec('ALTER TABLE bootstrap_file_drafts ADD COLUMN important INTEGER NOT NULL DEFAULT 0');
-          this.db.exec("UPDATE workspace_state SET schema_version = 2; DELETE FROM maintenance WHERE status IN ('open','prepared')");
+        if (previous > 0) {
+          for (const [table, oldName, newName] of [
+            ['workspace_state', 'generation', 'physical_revision'],
+            ['semantic_tasks', 'generation', 'physical_revision'],
+            ['maintenance', 'base_generation', 'base_physical_revision'],
+          ]) {
+            const columns = this.all<{ name: string }>(`PRAGMA table_info(${table})`);
+            if (columns.some((c) => c.name === oldName)) this.db.exec(`ALTER TABLE ${table} RENAME COLUMN ${oldName} TO ${newName}`);
+          }
+          if (previous === 1 && !this.all<{ name: string }>('PRAGMA table_info(files)').some((c) => c.name === 'important')) {
+            this.db.exec('ALTER TABLE files ADD COLUMN important INTEGER NOT NULL DEFAULT 0');
+          }
+          for (const table of ['bootstrap_state', 'bootstrap_manifest', 'bootstrap_chunks', 'bootstrap_file_drafts', 'bootstrap_cluster_drafts', 'bootstrap_assignments']) {
+            this.db.exec(`DROP TABLE IF EXISTS ${table}`);
+          }
+          this.db.exec("DELETE FROM meta WHERE key LIKE 'bootstrap-batch:%'");
         }
+        this.db.exec(DDL);
+        this.db.exec(`UPDATE workspace_state SET schema_version = ${SCHEMA_VERSION};
+          UPDATE semantic_tasks SET state = 'superseded' WHERE state IN ('pending','running','awaiting_result');
+          DELETE FROM maintenance WHERE status IN ('open','prepared')`);
         this.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)", String(SCHEMA_VERSION));
       });
     } finally {
@@ -376,7 +340,7 @@ export class Database {
     }
   }
 
-  /** Read-only deferred transaction giving a consistent snapshot of one committed generation. */
+  /** Read-only deferred transaction giving a consistent snapshot of one committed physical_revision. */
   readTransaction<T>(fn: () => T): T {
     this.db.exec('BEGIN DEFERRED');
     try {

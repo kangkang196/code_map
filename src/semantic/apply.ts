@@ -1,6 +1,5 @@
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { z } from 'zod';
 import type { Database } from '../storage/database.js';
 import { acquireLease, assertLeaseValid, releaseLease } from '../storage/lease.js';
 import { readWorkspaceState } from '../index/build.js';
@@ -13,28 +12,15 @@ import { acceptBaseline, fingerprint, reconcileSemanticStatus, semanticSnapshot,
 import { objectLocations } from './worklist.js';
 import { DEFAULT_ADAPTER_FINGERPRINT } from '../adapters/versions.js';
 
-export class ApplyError extends Error {
-  constructor(readonly code: string, message: string, readonly fields: string[] = []) { super(message); }
-}
-const location = z.strictObject({ path: z.string().min(1), start_line: z.number().int().positive().optional(), end_line: z.number().int().positive().optional() })
-  .refine((v) => v.end_line === undefined || (v.start_line !== undefined && v.end_line >= v.start_line));
-const common = { locations: z.array(location).max(16).optional() };
-const purpose = z.string().trim().min(1).max(160);
-export const OperationSchema = z.discriminatedUnion('op', [
-  z.strictObject({ op: z.literal('cluster'), key: z.string().trim().min(1).max(160), name: z.string().trim().min(1).max(160).optional(), purpose: purpose.optional(), remove: z.boolean().optional(), ...common }),
-  z.strictObject({ op: z.literal('file'), id: z.uuid(), cluster: z.string().min(1).optional(), important: z.boolean().optional(), purpose: purpose.max(96).optional(), content: z.string().max(240).optional(), ...common }),
-  z.strictObject({ op: z.literal('node'), id: z.uuid(), important: z.boolean().optional(), purpose: purpose.max(96).optional(), ...common }),
-  z.strictObject({ op: z.literal('keep'), kind: z.enum(['cluster', 'file', 'node']), id: z.uuid(), ...common }),
-]);
-export const PatchSchema = z.array(OperationSchema);
-export type Operation = z.infer<typeof OperationSchema>;
-export const OPERATION_JSON_SCHEMA = z.toJSONSchema(PatchSchema);
+import { ApplyError, InitialSchema, PatchSchema, normalizeInitial, PATCH_MAX_BYTES, INITIAL_MAX_BYTES, type Operation, type FieldSources } from './submission.js';
+export { ApplyError, OperationSchema, PatchSchema, OPERATION_JSON_SCHEMA } from './submission.js';
+export type { Operation } from './submission.js';
 
 export interface ApplyResult {
   applied: boolean;
   already_applied: boolean;
   semantic_revision: number;
-  generation: number;
+  physical_revision: number;
   updated: { clusters: number; files: number; nodes: number; assignments: number };
 }
 
@@ -44,34 +30,45 @@ function canonical(value: unknown): unknown {
   return value;
 }
 
-/** One leased transaction for manual writes and both maintenance routes. */
+/** One leased transaction for initial publication, manual writes and both maintenance routes. */
 export function applyPatch(db: Database, rawJson: string, originalBase: string): ApplyResult {
-  if (Buffer.byteLength(rawJson, 'utf8') > 64 * 1024) throw new ApplyError('INVALID_INPUT', 'patch exceeds 64 KiB');
-  let parsed: unknown;
-  try { parsed = JSON.parse(rawJson.replace(/^\uFEFF/, '')); }
-  catch { throw new ApplyError('INVALID_JSON', 'patch must be a JSON operation array'); }
-  const validation = PatchSchema.safeParse(parsed);
-  if (!validation.success) throw new ApplyError('SCHEMA_INVALID', validation.error.message);
-  const operations = validation.data;
   let base: ReturnType<typeof parseBase>;
   try { base = parseBase(originalBase); } catch (err) { throw new ApplyError('INVALID_BASE', (err as Error).message); }
-  const requestHash = fingerprint([originalBase, operations.map(canonical).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))]);
+  const initial = Boolean(base.bootstrap_id);
+  const maxBytes = initial ? INITIAL_MAX_BYTES : PATCH_MAX_BYTES;
+  if (Buffer.byteLength(rawJson, 'utf8') > maxBytes) throw new ApplyError('INVALID_INPUT', `submission exceeds ${maxBytes} bytes`);
+  let parsed: unknown;
+  try { parsed = JSON.parse(rawJson.replace(/^\uFEFF/, '')); }
+  catch { throw new ApplyError('INVALID_JSON', 'submission must be valid JSON'); }
+  const validation = (initial ? InitialSchema : PatchSchema).safeParse(parsed);
+  if (!validation.success) throw new ApplyError('SCHEMA_INVALID', validation.error.message);
+  let operations: Operation[] = initial ? [] : validation.data as Operation[];
+  let sources = new Map<string, FieldSources>();
+  const payload = initial ? canonical(validation.data) : operations.map(canonical).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const requestHash = fingerprint([originalBase, payload]);
   const lease = acquireLease(db);
   try {
     return db.transaction(() => {
       assertLeaseValid(db, lease);
       const ws = readWorkspaceState(db)!;
       const updated = { clusters: 0, files: 0, nodes: 0, assignments: 0 };
-      const response = (applied: boolean, already_applied = false): ApplyResult => ({ applied, already_applied, generation: ws.generation, semantic_revision: ws.semantic_revision, updated });
-      if (!ws || ws.build_status !== 'ready') throw new ApplyError('INDEX_NOT_READY', 'no published index');
+      const response = (applied: boolean, already_applied = false): ApplyResult => ({ applied, already_applied, physical_revision: ws.physical_revision, semantic_revision: ws.semantic_revision, updated });
+      if (!ws) throw new ApplyError('INDEX_NOT_READY', 'no index snapshot');
       if (ws.workspace_id !== base.workspace_id) throw new ApplyError('WORKSPACE_MISMATCH', 'base belongs to another workspace');
       if (db.get("SELECT 1 FROM maintenance WHERE target_kind = '__patch__' AND idempotency_key = ?", requestHash)) return response(false, true);
-      if (ws.generation !== base.generation || ws.semantic_revision !== base.semantic_revision) throw new ApplyError('VERSION_CONFLICT', 'submission base changed; read the index again');
+      if (ws.physical_revision !== base.physical_revision || ws.semantic_revision !== base.semantic_revision) throw new ApplyError('VERSION_CONFLICT', 'submission base changed; read the index again');
+      if (initial) {
+        if (ws.build_status !== 'building' || ws.physical_revision !== 0 ||
+            db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'bootstrap_id'")?.value !== base.bootstrap_id) {
+          throw new ApplyError('VERSION_CONFLICT', 'initial task changed; read the current task');
+        }
+      } else if (ws.build_status !== 'ready') throw new ApplyError('INDEX_NOT_READY', 'no published index');
       const verify = () => {
         const config = loadConfig(ws.root_path);
         if (configFingerprint(config) !== ws.config_fingerprint || ws.adapter_fingerprint !== DEFAULT_ADAPTER_FINGERPRINT || discover(ws.root_path, config).manifestHash !== ws.manifest_hash) throw new ApplyError('INDEX_STALE', 'source or configuration changed; read the index again');
       };
       verify();
+      if (initial) ({ operations, sources } = normalizeInitial(db, validation.data as ReturnType<typeof InitialSchema.parse>, ws.root_path));
       let allowed: Set<string> | null = null;
       if (base.worklist_id) {
         const task = db.get<{ state: string; allowed: string; worklist: string }>('SELECT state, allowed, worklist FROM semantic_tasks WHERE worklist_id = ?', base.worklist_id);
@@ -147,7 +144,7 @@ export function applyPatch(db: Database, rawJson: string, originalBase: string):
             db.run(`INSERT INTO semantics (node_id, purpose, content, purpose_source, content_source) VALUES (?, ?, ?, ?, ?)
               ON CONFLICT(node_id) DO UPDATE SET purpose = COALESCE(excluded.purpose, semantics.purpose), content = COALESCE(excluded.content, semantics.content),
               purpose_source = COALESCE(excluded.purpose_source, semantics.purpose_source), content_source = COALESCE(excluded.content_source, semantics.content_source)`,
-              id, op.purpose ?? null, content ?? null, op.purpose === undefined ? null : 'agent', content === undefined ? null : 'agent');
+              id, op.purpose ?? null, content ?? null, op.purpose === undefined ? null : sources.get(id)?.purpose ?? 'agent', content === undefined ? null : sources.get(id)?.content ?? 'agent');
             reviewed.add(key);
           }
           if (kind === 'file') updated.files++; else updated.nodes++;
@@ -162,32 +159,40 @@ export function applyPatch(db: Database, rawJson: string, originalBase: string):
       for (const id of newClusters) if (!db.get('SELECT 1 FROM files WHERE cluster_id = ?', id)) throw new ApplyError('EMPTY_CLUSTER', 'a new Cluster needs at least one member');
       if (db.get('SELECT 1 FROM file_highlights GROUP BY file_id HAVING COUNT(*) > 8')) throw new ApplyError('TOO_MANY_HIGHLIGHTS', 'at most eight important nodes per file');
       const final = semanticSnapshot(db);
+      const verifiedLocations = new Map<string, { fileId: string; lines?: number }>();
       for (const [op, target] of targets) {
         // References are data. They must point into the included, unchanged source snapshot.
         for (const loc of op.locations ?? objectLocations(db, target.kind, target.id)) {
           if (/^[\\/]|^[a-zA-Z]:/.test(loc.path) || loc.path.split(/[\\/]/).includes('..')) throw new ApplyError('INVALID_LOCATION', 'location must be relative to the workspace');
-          const file = db.get<{ file_id: string; file_hash: string }>('SELECT file_id, file_hash FROM files WHERE path = ?', loc.path);
-          if (!file || hashFile(managedPath(ws.root_path, loc.path)).fileHash !== file.file_hash) throw new ApplyError('INVALID_LOCATION', 'location must reference current included source');
-          if (allowed && !allowed.has(`file:${file.file_id}`)) throw new ApplyError('TARGET_OUT_OF_SCOPE', 'location is outside the worklist scope');
+          let verified = verifiedLocations.get(loc.path);
+          if (!verified) {
+            const file = db.get<{ file_id: string; file_hash: string }>('SELECT file_id, file_hash FROM files WHERE path = ?', loc.path);
+            if (!file || hashFile(managedPath(ws.root_path, loc.path)).fileHash !== file.file_hash) throw new ApplyError('INVALID_LOCATION', 'location must reference current included source');
+            verified = { fileId: file.file_id };
+            verifiedLocations.set(loc.path, verified);
+          }
+          if (allowed && !allowed.has(`file:${verified.fileId}`)) throw new ApplyError('TARGET_OUT_OF_SCOPE', 'location is outside the worklist scope');
           if (loc.start_line !== undefined) {
-            const lines = readFileSync(managedPath(ws.root_path, loc.path), 'utf8').split(/\r?\n/).length;
-            if ((loc.end_line ?? loc.start_line) > lines) throw new ApplyError('INVALID_LOCATION', 'location exceeds the source line range');
+            verified.lines ??= readFileSync(managedPath(ws.root_path, loc.path), 'utf8').split(/\r?\n/).length;
+            if ((loc.end_line ?? loc.start_line) > verified.lines) throw new ApplyError('INVALID_LOCATION', 'location exceeds the source line range');
           }
         }
       }
-      for (const key of reviewed) {
-        const object = final.get(key);
-        if (object) acceptBaseline(db, object);
-      }
-      for (const key of structural) {
-        const object = final.get(key)!;
+      const accepted = initial ? new Set(final.keys()) : reviewed;
+      if (!initial) for (const key of structural) {
         // Classification does not confirm the old description of a selected file.
-        if (!object.selected) acceptBaseline(db, object);
+        if (!final.get(key)!.selected) accepted.add(key);
       }
+      for (const key of accepted) if (final.has(key)) acceptBaseline(db, final.get(key)!);
       verify();
       assertLeaseValid(db, lease);
       if (!operations.length) return response(false);
       reconcileSemanticStatus(db);
+      if (initial) {
+        ws.physical_revision = 1;
+        db.run("UPDATE workspace_state SET physical_revision = 1, build_status = 'ready'");
+        db.run("DELETE FROM meta WHERE key = 'bootstrap_id'");
+      }
       ws.semantic_revision++;
       db.run('UPDATE workspace_state SET semantic_revision = ?, updated_at = ?', ws.semantic_revision, Date.now());
       db.run(`INSERT INTO maintenance (batch_id, target_kind, target_id, change_kind, status, idempotency_key, payload, created_at, updated_at)

@@ -4,7 +4,7 @@ Windows 优先的 Codex 代码导航插件。用 Node.js 24.15.0 或更高版本
 
 ```text
 use-code-map Skill → CLI query → 查询层 → SQLite
-code-map-init → 索引与语言适配器 → SQLite
+code-map-init → 索引器生成事实与任务 → Agent 单份语义 JSON → annotate → SQLite
 PostToolUse / 默认查询 / Stop → sync → SQLite 事实
 Stop → 完整工作单 → 宿主隔离维护 / 显式主 Agent 降级 → 执行器 → annotate → SQLite 语义
 ```
@@ -20,7 +20,7 @@ Stop → 完整工作单 → 宿主隔离维护 / 显式主 Agent 降级 → 执
 - 沿用严格 TypeScript、ESM、两空格缩进及相对导入的 `.js` 后缀。外部 JSON 用已有 Zod schema 校验。CLI 和 Hook 把 JSON 写到 stdout，把日志写到 stderr。
 - 显式初建（含预览）或工作区已启用时才扫描源码。启用后才写入 `.codemap/`。遵守工作区边界和忽略规则，把项目代码当作数据处理。
 - CLI 与独立 stdio MCP 共用查询实现。默认插件由 `use-code-map` 按需调用 CLI。按任务粒度查询，保留证据、版本与分页约定。
-- 解析器生成事实，Agent 提交语义。事实更新沿用租约与事务，语义补丁校验版本和指纹。Stop 从语义基线生成完整工作单，按会话和回合绑定结果。默认不阻塞主回合；显式主 Agent 降级最多续跑一次。
+- 解析器生成事实，Agent 提交语义。事实更新沿用租约与事务，初建、手动补丁和 Stop 结果共用语义写入器，校验原 base、版本和指纹。物理版本字段为 physical_revision。Stop 从语义基线生成完整工作单，按会话和回合绑定结果。默认不阻塞主回合；显式主 Agent 降级最多续跑一次。
 
 ## 验证与打包
 

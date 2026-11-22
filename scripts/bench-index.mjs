@@ -9,8 +9,9 @@ import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { configFingerprint, DEFAULT_CONFIG } from '../dist/workspace/discovery.js';
-import { buildFacts, initializeWorkspace, newBootstrapId } from '../dist/index/build.js';
-import { startBootstrap, nextBatch, submitBatch, publish } from '../dist/index/bootstrap.js';
+import { buildFacts, initializeWorkspace } from '../dist/index/build.js';
+import { startBootstrap, initialTask } from '../dist/index/bootstrap.js';
+import { applyPatch } from '../dist/semantic/apply.js';
 import { syncWorkspace } from '../dist/index/sync.js';
 
 const profile = process.argv[2] ?? 'A';
@@ -65,28 +66,18 @@ try {
     mkdirSync(join(root, lang));
     for (let i = 0; i < perLanguage; i++) writeFileSync(join(root, lang, `mod${i}.${lang}`), makeSource(lang, i));
   }
-  const bootstrapId = newBootstrapId();
   env = initializeWorkspace(root, DEFAULT_CONFIG, configFingerprint(DEFAULT_CONFIG));
   let facts;
   const build = await measure(async () => { facts = await buildFacts(env); });
   console.error(`[bench] build ${build.toFixed(0)} ms, ${facts.counts.fileCount} files, ${facts.counts.nodeCount} nodes, phases=${JSON.stringify(facts.timingMs)}`);
-  startBootstrap(env.db, { bootstrapId, manifestHash: facts.manifest.manifestHash, configFingerprint: env.configFingerprint, adapterFingerprint: env.adapterFingerprint, root, files: facts.manifest.files });
-  // Fixed synthetic descriptions exercise the same read/receipt/classification path as a real initial build.
-  let batchCount = 0;
+  startBootstrap(env.db);
+  // Synthetic semantics exercise the shared writer, not real Agent reasoning.
   const bootstrap = await measure(async () => {
-    for (let batch = nextBatch(env.db, root); batch.phase !== 'done'; batch = nextBatch(env.db, root)) {
-      const payload = { schema_version: 2, bootstrap_id: bootstrapId, manifest_hash: facts.manifest.manifestHash, batch_id: batch.batch_id, phase: batch.phase };
-      if (batch.phase === 'read') {
-        payload.read_chunk_ids = batch.items.map((i) => i.chunk_id);
-        payload.files = [...new Map(batch.items.map((i) => [i.path, { path: i.path, file_hash: i.file_hash, important: true, purpose: 'Benchmark module', content: 'Exports fixture functions.' }])).values()];
-      } else {
-        payload.clusters = [{ key: 'fixtures', name: 'Fixtures', purpose: 'Benchmark sources' }];
-        payload.assignments = batch.items.map((i) => ({ path: i.path, cluster_key: 'fixtures' }));
-      }
-      submitBatch(env.db, JSON.stringify(payload));
-      batchCount++;
-    }
-    publish(env.db, { workspaceId: env.state.workspace_id, root, config: DEFAULT_CONFIG });
+    const task = initialTask(env.db);
+    const result = { clusters: [{ key: 'fixtures', name: 'Fixtures', purpose: 'Benchmark sources', files: task.files.map((f) => ({
+      id: f.id, important: true, purpose: 'Benchmark module', content: 'Exports fixture functions.',
+    })) }] };
+    applyPatch(env.db, JSON.stringify(result), task.base);
   });
   const unchanged = await sample(() => measure(async () => {
     if ((await syncWorkspace(env, 'sync')).status !== 'unchanged') throw new Error('unexpected index change');
@@ -161,7 +152,7 @@ try {
     profile, rounds, warmups, node: process.version, os: `${process.platform} ${release()}`, logical_cpus: availableParallelism(), ram_bytes: totalmem(),
     files: facts.counts.fileCount, nodes: facts.counts.nodeCount, bytes: facts.manifest.files.reduce((sum, file) => sum + file.byteSize, 0),
     build_phases_ms: facts.timingMs,
-    bootstrap_ms: +bootstrap.toFixed(2), bootstrap_batches: batchCount,
+    bootstrap_ms: +bootstrap.toFixed(2), bootstrap_submissions: 1,
     database_bytes: statSync(join(root, '.codemap', 'index.sqlite')).size,
     mcp_calls: calls, max_mcp_response_bytes: largestResponse, checks,
     cli: { calls: cliCalls, single_p95_ms: cliSingle, concurrent_8_p95_ms: cliConcurrent },

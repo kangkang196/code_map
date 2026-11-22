@@ -31,9 +31,9 @@ async function handleStop(event: StopEvent): Promise<Record<string, unknown>> {
     return env.db.transaction(() => {
       const ws = readWorkspaceState(env.db)!;
       // An actual failure/limit on this version pair is not retried automatically.
-      if (env.db.get("SELECT 1 FROM semantic_tasks WHERE generation = ? AND semantic_revision = ? AND state IN ('failed','limited','conflict','complete')", ws.generation, ws.semantic_revision)) return {};
+      if (env.db.get("SELECT 1 FROM semantic_tasks WHERE physical_revision = ? AND semantic_revision = ? AND state IN ('failed','limited','conflict','complete')", ws.physical_revision, ws.semantic_revision)) return {};
       if (env.db.get("SELECT 1 FROM semantic_tasks WHERE state IN ('running','awaiting_result')")) return {};
-      if (env.db.get('SELECT 1 FROM semantic_tasks WHERE session_id = ? AND turn_id = ? AND generation = ? AND semantic_revision = ?', event.session_id, turnId, ws.generation, ws.semantic_revision)) return {};
+      if (env.db.get('SELECT 1 FROM semantic_tasks WHERE session_id = ? AND turn_id = ? AND physical_revision = ? AND semantic_revision = ?', event.session_id, turnId, ws.physical_revision, ws.semantic_revision)) return {};
       env.db.run("UPDATE semantic_tasks SET state = 'superseded', updated_at = ? WHERE state = 'pending'", Date.now());
       const worklist = prepareWorklist(env.db, { sessionId: event.session_id, turnId, route: mode });
       if (!worklist.reviews.length && !worklist.unassigned_files.length) return {};

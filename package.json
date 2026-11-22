@@ -1,6 +1,6 @@
 {
   "name": "code-map",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Code navigation plugin for coding agents: cluster/file/highlight semantics with source-backed relations and static paths.",

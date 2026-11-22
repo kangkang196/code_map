@@ -1,5 +1,7 @@
 # Code Map 事实与语义索引维护方案
 
+2026-11-22 接口更新：当前物理版本字段为 `physical_revision`，查询与提交协议为 v3。初建改为单任务、单份语义 JSON，复用 `annotate --apply`。下文保留 v0.3 维护设计背景，现行初建契约见 [设计方案](design.md) 和 [协议](../skills/use-code-map/references/protocol.md)。
+
 拟议方案。现有 v0.2 的查询会校验索引，靠显式 `sync` 或 Stop 更新事实；初建发布还要求所有文件有用途，Stop 会分批要求主 Agent 续跑。本方案替换这些行为。查询与语义更新协议统一升为 v2，不为旧字段另设兼容别名。实现时同步更新 README、AGENTS.md、设计文档、技能、协议和打包检查；这些文件当前仍描述已实现的 v0.2。
 
 ```text
@@ -24,7 +26,7 @@ Stop → 工作单 → 主回合结束 → 后台 fork 维护 Agent ─┐
 
 初建继续要求 Agent 读完全部纳入源码，并校验文件归属完整且无重复。发布时要求正式 Cluster、重要文件和重要节点有用途或职责说明。普通文件没有语义也能发布。增量发现的新文件先归到系统管理的「待归类」组，立即可查；归类是结构任务，不要求为普通文件写用途。删除文件或节点时清理失效归属和引用，并保留供受影响上级复核的变更证据。
 
-- `physical_index.generation` 跟踪事实快照，包括索引清单、内容、位置和关系。事实变更和受影响语义状态在同一事务更新。
+- `physical_index.physical_revision` 跟踪事实快照，包括索引清单、内容、位置和关系。事实变更和受影响语义状态在同一事务更新。
 - `semantic_revision` 跟踪 Agent 提交并被接受的用途、职责、归属、重要性或复核结果。同步造成的待复核或引用清理仅改变事实版本。两者随查询返回；同一批查询读同一版本对。
 - **语义基线**保存上次成功接受的语义所对应的相关物理事实，按对象记录指纹，并保留判断成员新增、删除和归属变化所需的结构清单。初建发布时建立基线；普通对象不因此获得语义。只需保留已接受的基线和当前物理状态，不累计各会话的相对增量。
 - 已选对象的语义状态为 `reviewed`、`needs_review` 或 `missing`；普通对象是 `not_selected`。状态及工作单均可从语义基线与当前物理状态重新计算。纯行号移动可改变事实版本，但不触发语义复核；改动又撤销时，不留下多余待办。指纹采用与对象有关的规范化事实，保留有意义的语法和关系，忽略纯位置变化。无法可靠比较时，将受影响的重要对象标为待复核。
@@ -51,7 +53,7 @@ Stop → 工作单 → 主回合结束 → 后台 fork 维护 Agent ─┐
 {
   "schema_version": 2,
   "workspace_id": "ws_orders",
-  "physical_index": {"status": "valid", "generation": 41},
+  "physical_index": {"status": "valid", "physical_revision": 41},
   "semantic_revision": 7,
   "base": "q_41_7",
   "node": {
@@ -141,7 +143,7 @@ Hook 做最终事实同步，再生成一份完整工作单：`reviews` 放待�
   "base": "w_wl_41_7",
   "session_id": "session_1",
   "turn_id": "turn_8",
-  "base_generation": 41,
+  "base_physical_revision": 41,
   "base_semantic_revision": 7,
   "reviews": [
     {"kind": "cluster", "id": "00000000-0000-4000-8000-000000000001", "key": "orders",

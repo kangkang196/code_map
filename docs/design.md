@@ -1,6 +1,6 @@
 # Code Map 设计方案
 
-修订于 2026-11-21。当前维护协议为 v2；实施状态见 [维护验收记录](index-maintenance-acceptance.md)。
+修订于 2026-11-22。当前协议为 v3；实施状态见 [初建验收记录](initial-build-acceptance.md) 和 [维护验收记录](index-maintenance-acceptance.md)。
 
 ## 1. 目标与边界
 
@@ -93,69 +93,33 @@ v0.1 交付完整初建、四个查询工具和手动增量维护。v0.2 增加 
 
 ### 3.2 首次构建
 
-初建 Skill 的唯一名称和菜单显示名均为 `code-map-init`。桌面 `/` 菜单搜索该名称，或使用显式调用 `$code-map-init`。`policy.allow_implicit_invocation` 设为 `false`。在目标客户端验收英文入口。[斜杠菜单](https://learn.chatgpt.com/docs/app/slash-commands) · [技能调用策略](https://learn.chatgpt.com/docs/build-skills#optional-metadata)
-
-Agent 以当前工作区或指定目录为 `root`，通过 `init --dry-run` 查看按目录组织的文件清单、纳入数、排除数、语言和字节数。预览后 `init` 建立暂存快照。仅预览时结束于此。无源码返回 `NO_SOURCE_FILES`。就绪时报告当前版本，恢复未完成的构建时调用 `sync --resume`。
+初建入口为 `code-map-init`，禁止隐式调用。用户显式调用后，直接按工作区配置与忽略规则构建，无需二次确认。`init --dry-run` 仅用于显式预览，不写文件。
 
 ```text
-同一暂存文件清单（目录、路径、文件哈希）
-    ├─ 索引器 → 解析、跨文件绑定、事实校验 ─────┐
-    └─ Agent → 逐批读取完整源码 → 提交语义 JSON ─┤
-                                                 ↓
-              校验语义、补缺、校验 Cluster 覆盖 → 发布 generation=1
+code-map-init → init → 物理事实 + 初建任务文件
+                              │
+              Agent 用宿主读文件、搜索工具读取全部纳入源码
+                              │
+                       一份语义 JSON
+                              │
+手动补丁 / Stop 结果 ──→ annotate --apply → 共用校验与事务 → SQLite
 ```
 
-首次 Agent 阅读按目录和文件分批。每批源码最多 16 KiB。长文件在 UTF-8 字符边界分片，按不重叠字节范围覆盖完整内容，保留起始行号。忽略文件从共享清单排除。Agent 收到源码、位置、文件哈希、批次状态和必要的校验错误。AST、符号清单和边留在索引器内部。Agent 标记重点声明，发布时由索引器解析为 ID。
+`init` 返回任务文件路径和原 `base`。任务包含完整文件范围、索引器分配的文件与节点 ID、声明位置、任务指令和自动生成的输出 schema。初建完成前，常规地图查询仍被状态门禁拒绝；Agent 使用宿主普通工具读取源码。
 
-事实解析按文件批次落检查点。语义 JSON 每批校验后暂存。`sync --resume` 重验清单、内容、配置和适配器版本，复用匹配的阅读记录和草稿。变更文件重新读取，涉及的 Cluster 归属重新核对。发布前复核文件清单及哈希。无法读取的纳入文件阻止发布并返回路径。可读取但解析失败的文件仍须阅读和归类，解析限制记录在覆盖率内。
+索引器维护文件、节点、位置、物理包含关系、可解析的静态关系、诊断、指纹与版本。Agent 定义 Cluster 归属、重要性及用途职责。Agent 可多次调用阅读工具，最终只提交一份 JSON，不输出物理事实副本。
 
-已有 ready 索引的全量重建，先写独立的构建数据库，继续提供明确标识的旧 generation；完成后通过 SQLite 事务导入并切换 active generation，不能直接覆盖仍被 Windows 进程打开的数据库文件。首次构建、重建、schema 升级均不修改业务源码。
+`sync --resume` 或重新运行 `init` 刷新暂存事实并签发新任务及新 `base`，复用仍有效的对象 ID。旧任务结果不能改绑新基线。已有 ready 索引的重建继续使用独立暂存库和事务导入，保留失败回滚与旧读句柄行为。
 
 ### 3.3 首次语义 JSON 契约
 
-`init --next` 按阶段输出 `bootstrap_id`、`manifest_hash`、`batch_id`、`phase` 和待处理项。`read` 阶段每项含 `chunk_id`、`path`、`file_hash`、字节范围、起始行号和源码。`classify` 阶段返回待归类文件的路径与语义草稿，以及已定义 Cluster 的键和用途。`init --submit --input FILE` 接收对应 JSON，上限 64 KiB。回执覆盖已交付片段，同一批次和内容可幂等重放。阅读覆盖按源码范围核对。
+初建结果按 `clusters → files → highlights` 表达语义层级。每个 Cluster 有唯一 `key`、名称和用途；每个纳入文件恰好出现一次。普通文件只需文件 ID；重要文件提供 `important: true`、用途和内容；重点节点只需节点 ID 和职责。节点的物理归属与更细的类、方法包含关系由索引器验证和维护。
 
-| 字段 | 约束 |
-|---|---|
-| `schema_version`、`bootstrap_id`、`manifest_hash`、`batch_id`、`phase` | 绑定本次构建、清单、批次与阶段。协议版本为 `2` |
-| `read_chunk_ids`、`files` | `read` 阶段。回执覆盖本批片段。文件读完后提交 `path`、`file_hash` 和 `highlights`，以及可用的 `purpose`、`content`。仅 `important: true` 的文件要求用途；普通文件可以省略语义 |
-| `highlights[]` | `qualified_name`、`declaration_line`、`purpose`。限定名用 `.` 连接声明的词法父级和名称，行号指声明名称所在行，从 1 开始。校验同文件唯一匹配。允许空列表 |
-| `clusters`、`assignments` | `classify` 阶段。定义 `{key,name,purpose}`，逐文件写 `{path,cluster_key}`。`key` 在本次构建内唯一，引用同批或已保存的定义，发布时分配 `cluster_id` |
+初建树形结果和增量操作数组共享 `annotate --apply --base BASE --input FILE|-`。初建树先归一化为现有操作模型；共用对象、范围、指纹、版本、幂等、语义基线和租约事务校验。初建要求全文件覆盖并一次发布；增量只推进本次语义提交所处理对象的基线，省略项继续保留待办。这里的提交与 Git commit 无关。
 
-```json
-{
-  "schema_version": 2,
-  "bootstrap_id": "B1",
-  "manifest_hash": "example-sha256",
-  "batch_id": "read-1",
-  "phase": "read",
-  "read_chunk_ids": ["chunk-1"],
-  "files": [{
-    "path": "orders/service.py",
-    "file_hash": "example-file-sha256",
-    "important": true,
-    "purpose": "提供订单创建入口",
-    "content": "校验请求并按配置保存订单",
-    "highlights": [{"qualified_name": "create_order", "declaration_line": 40, "purpose": "校验并保存订单"}]
-  }]
-}
-```
+单份初建结果上限 16 MiB，增量操作数组仍为 64 KiB。重要文件与节点遗漏说明时，可从当前注释补缺并保留 `doc_comment` 来源。校验失败整份回滚。成功时在同一事务发布 `physical_revision=1`、`semantic_revision=1`、语义基线与 ready 状态。完整字段及示例见 [v3 协议](../skills/use-code-map/references/protocol.md)。
 
-分类批次使用同一信封，示例省略完整哈希。
-
-```json
-{
-  "schema_version": 2,
-  "bootstrap_id": "B1",
-  "manifest_hash": "example-sha256",
-  "batch_id": "classify-1",
-  "phase": "classify",
-  "clusters": [{"key": "orders", "name": "订单处理", "purpose": "校验并保存订单"}],
-  "assignments": [{"path": "orders/service.py", "cluster_key": "orders"}]
-}
-```
-
-`init --publish` 校验完整阅读、文件归属、同文件重点节点引用、语义长度和版本。Agent 遗漏文件语义或重点节点职责时，提取对应的当前注释补缺，逐字段标记 `doc_comment`。Cluster 作用由 Agent 提交。校验失败返回对象和字段，`init --next` 生成修订批次。初建以事实和语义一并就绪为完成条件。
+`base` 绑定初建任务标识，避免暂存物理版本始终为零时接受旧结果。写入前后复核源码清单、配置和适配器。文件归属覆盖校验不等于证明 Agent 已阅读或理解源码；完整阅读通过任务要求与真实执行记录验收。
 
 ## 4. 查询粒度与导航
 
@@ -234,7 +198,7 @@ TS 重载和合法声明合并使用一个逻辑符号，保留多条 declaratio
 | `start_line/end_line` | 从 1 开始，首尾均包含，供人和 Agent 阅读 |
 | `start_byte/end_byte` | 原始 UTF-8 字节位置，左闭右开 |
 | `file_hash` | 原始文件 SHA-256；行号与证据均绑定此哈希 |
-| `generation` | 本工作区已提交的事实索引版本 |
+| `physical_revision` | 本工作区已提交的事实索引版本 |
 | `semantic_revision` | 独立的语义版本；纯语义写入不重建事实图 |
 
 解析器适配器必须显式转换坐标。TS 的 UTF-16 偏移与 Python WASM 解析器返回的偏移不能直接当作 UTF-8 字节偏移。CRLF、BOM、中文和 emoji 都有固定测试。首版索引 UTF-8／UTF-8 BOM；其他编码保留文件节点并返回 `UNSUPPORTED_ENCODING`。
@@ -247,7 +211,7 @@ TS 重载和合法声明合并使用一个逻辑符号，保留多条 declaratio
 
 | 表 | 关键内容 | 约束 |
 |---|---|---|
-| `workspace_state` | 工作区 ID、根路径、数据库版本、`generation`、`semantic_revision`、构建状态、清单与配置指纹 | 一个索引只属于一个规范根路径 |
+| `workspace_state` | 工作区 ID、根路径、数据库版本、`physical_revision`、`semantic_revision`、构建状态、清单与配置指纹 | 一个索引只属于一个规范根路径 |
 | `clusters` | `cluster_id`、名称、`purpose`、类型、语义状态、成员依赖指纹 | Agent 定义正常 Cluster，索引器维护保留的 `pending` Cluster |
 | `files` | `file_id`、相对路径、内容哈希、语言、解析状态、`cluster_id` | `file_id` 也是文件节点 ID。`cluster_id` 为非空外键，成员通过该列反查 |
 | `nodes` | `node_id`、种类、名称、限定名、`parent_id`、声明签名、`symbol_key`、`meaning_hash` | 节点 ID 在工作区内唯一，父子关系无环 |
@@ -260,9 +224,9 @@ TS 重载和合法声明合并使用一个逻辑符号，保留多条 declaratio
 | `semantic_baselines` | 对象已接受的指纹和结构清单 | 不随每次 sync 覆盖 |
 | `semantic_tasks` | 工作单、会话、回合、版本对、范围与任务状态 | 同工作区最多一个执行任务 |
 | `maintenance` | 已接受请求的规范化哈希与原 base | 幂等重放 |
-| `bootstrap_items`（暂存库） | 文件清单指纹、已读片段回执、文件草稿、Cluster 草稿和归属 | 按当前构建和文件哈希复用，发布后清理 |
+| 初建任务 | 暂存事实、任务标识、文件与节点引用、原 base 和输出 schema | 一次语义提交；恢复时更换任务，拒绝旧结果 |
 
-当前数据库 schema 2 增加文件重要性、`semantic_baselines` 和 `semantic_tasks`。升级前备份原索引；旧文件用途不自动成为重要性选择。后续迁移保留工作区、Cluster 和节点 ID。多跳路径按请求生成。
+当前数据库 schema 3 保留文件重要性、`semantic_baselines` 和 `semantic_tasks`，将物理修订字段统一为 `physical_revision` 并删除旧初建批次表。升级前备份原索引；旧文件用途不自动成为重要性选择。后续迁移保留工作区、Cluster 和节点 ID。多跳路径按请求生成。
 
 查询索引覆盖规范路径、`(cluster_id, path)`、限定名、边的两个端点、诊断所属节点和重点节点的反向导航。入边与出边查询共享 `edges` 表。
 
@@ -356,7 +320,7 @@ create_order
 | 公共输出 | 用途 |
 |---|---|
 | `schema_version` | 协议兼容 |
-| `workspace_id`、`physical_index.generation`、`semantic_revision`、`base` | 绑定同一地图版本 |
+| `workspace_id`、`physical_index.physical_revision`、`semantic_revision`、`base` | 绑定同一地图版本 |
 | `status` | `ok`、`candidates`、`partial`、`error` |
 | `focus` 或 `items` | 单目标详情或批量目标各自的状态和结果 |
 | `coverage` | 文件发现、解析和 Cluster 归类覆盖率，附排除、失败与未解析计数 |
@@ -366,7 +330,7 @@ create_order
 
 节点、关系和 Region 均附 ID。位置带文件哈希。路径步骤 ID 只用于当前查询结果内的父子引用。`page.has_more=false` 表示当前查询结果已传输完。静态解析覆盖率与路径截断分别报告。
 
-游标绑定 generation、semantic_revision、输入指纹及最后排序键；版本变化时返回 `CURSOR_EXPIRED`。不能静默切换版本，造成重复或遗漏。无效参数、越界路径、未知 ID、过期位置和数据库故障使用固定错误码，并提供最小恢复动作，不返回堆栈或源码内容作为普通错误。
+游标绑定 physical_revision、semantic_revision、输入指纹及最后排序键；版本变化时返回 `CURSOR_EXPIRED`。不能静默切换版本，造成重复或遗漏。无效参数、越界路径、未知 ID、过期位置和数据库故障使用固定错误码，并提供最小恢复动作，不返回堆栈或源码内容作为普通错误。
 
 长签名在展示中最多保留 512 个 Unicode 字符，并附 signature_truncated；完整内容通过位置读取。诊断中的表达式最多 160 字符。若单个不可拆分的导航项仍超出预算，返回 `RESPONSE_ITEM_TOO_LARGE`，说明所需字节数和对象 ID；不能生成没有进展的续页游标。
 
@@ -434,7 +398,7 @@ CLI 与 stdio MCP 通过同一入口校验整个纳入源码集合，包括新�
 
 `physical_index.status: "valid"` 只说明物理索引已校验；对象的 `semantics.status` 独立报告语义复核状态，解析覆盖率另行报告。锁忙返回 `INDEX_REFRESHING`，无法证明当前结果有效返回 `INDEX_STALE`，版本变化使游标失效。
 
-MCP 每进程最多 4 个读取任务，队列上限 16，校验等待上限 8 秒。全量校验、同步和批量查询分别测量；现有性能门槛继续保留，v2 需要重新实测。
+MCP 每进程最多 4 个读取任务，队列上限 16，校验等待上限 8 秒。全量校验、同步和批量查询分别测量；现有性能门槛继续保留，v3 需要重新实测。
 
 ## 10. 可扩展语言适配器
 
@@ -461,7 +425,7 @@ Python 适配器从语法树建立模块和函数作用域，绑定具名函数�
 已接受语义基线 + 当前规范化事实 → 状态与完整工作单
 ```
 
-事实提交同时更新 generation 和受影响语义状态，不推进 semantic_revision。同步的影响集合只优化事实重算，不是工作单来源。TS／JS 使用固定版本编译器，Python 使用 Tree-sitter 与静态绑定；不执行项目代码。完整重建先校验独立暂存库，再用 active 库事务导入，旧读事务继续读取旧快照。
+事实提交同时更新 physical_revision 和受影响语义状态，不推进 semantic_revision。同步的影响集合只优化事实重算，不是工作单来源。TS／JS 使用固定版本编译器，Python 使用 Tree-sitter 与静态绑定；不执行项目代码。完整重建先校验独立暂存库，再用 active 库事务导入，旧读事务继续读取旧快照。
 
 每个对象保存上次被接受的规范化事实指纹。指纹包含有意义的语法、关系和结构，不含位置或语义文案。无法可靠解析时使用内容哈希保守复核。Cluster 指纹包含成员 ID、路径、事实和重要性；文件维护重要节点名单。纯位置移动不产生语义待办，改动撤销后状态可回到 reviewed。
 
@@ -484,7 +448,7 @@ Stop → 有时限的本地 sync → 完整工作单登记 → 主回合结束
 
 只有显式设置 maintenance_mode=main 才允许一次 Stop block。维护 Agent 不编辑源码、不直接写索引、不派发任务，只返回 JSON。Stop 仅接收已登记、同会话及同回合的续跑结果；普通聊天 JSON 不进入写入器。无效、缺失、超限和冲突结果保留待办；实际失败的相同版本任务不自动重跑。
 
-补丁协议为 cluster、file、node、keep 操作数组。文件与标准输入共享 UTF-8 格式和 64 KiB 上限。base 绑定工作区、协议和两个版本，自动任务还绑定工作单范围。先校验最终结构，整份事务提交；已复核对象绑定最终指纹，省略项保持原基线。相同规范数组和原 base 可幂等重放；其余旧版本请求返回 VERSION_CONFLICT。完整字段见 [v2 协议](../skills/use-code-map/references/protocol.md)。
+补丁协议为 cluster、file、node、keep 操作数组。文件与标准输入共享 UTF-8 格式和 64 KiB 上限。base 绑定工作区、协议和两个版本，自动任务还绑定工作单范围。先校验最终结构，整份事务提交；已复核对象绑定最终指纹，省略项保持原基线。相同规范数组和原 base 可幂等重放；其余旧版本请求返回 VERSION_CONFLICT。完整字段见 [v3 协议](../skills/use-code-map/references/protocol.md)。
 
 ## 13. 存储、配置与安全边界
 
@@ -494,7 +458,7 @@ Stop → 有时限的本地 sync → 完整工作单登记 → 主回合结束
 
 Code Map 对已跟踪和未跟踪文件统一应用忽略规则与显式排除。有 Git 时用 NUL 分隔的 `git ls-files --cached --others --exclude-standard -z` 枚举，再用 `git check-ignore --no-index -z --stdin` 复核已跟踪项。无 Git 时遍历并应用同目录层级的忽略规则。根外链接和子模块只记录边界。每个 worktree 有独立的 `.codemap` 和工作区 ID。
 
-SQLite 使用 WAL、外键约束和 5 秒 busy timeout。同工作区写入租约保存在数据库中，包含 owner nonce、单调递增 fencing token 和到期时间；租期 45 秒，每 5 秒续租。提交事务必须核对 token 与有效租约。租约被接管后，旧进程无权提交，即使它恢复运行。MCP 与 CLI 使用相同更新路径。读事务只返回一个已提交 generation。
+SQLite 使用 WAL、外键约束和 5 秒 busy timeout。同工作区写入租约保存在数据库中，包含 owner nonce、单调递增 fencing token 和到期时间；租期 45 秒，每 5 秒续租。提交事务必须核对 token 与有效租约。租约被接管后，旧进程无权提交，即使它恢复运行。MCP 与 CLI 使用相同更新路径。读事务只返回一个已提交 physical_revision。
 
 查询按第 9.6 节共享清单检查，定位结果输出前复核所用文件。连续变化超过一次重试时返回 `WORKTREE_BUSY`。新鲜度表示检查时点。
 
@@ -516,7 +480,7 @@ Hook 使用 `./hooks/hooks.json`。Windows 在 Node 中读取 `PLUGIN_ROOT` 并�
 
 ## 15. 最脆弱前提与降级
 
-首次全量语义构建的主要成本是 Agent 阅读。按目录分批、记录检查点和使用已存摘要完成分类，可跨轮继续。发布门槛要求覆盖全部纳入文件。自动维护依赖受信任的 Hook 与拥有源 thread 的宿主连接；缺少隔离能力时保留待办，手动维护使用当前 v2 接口。
+首次全量语义构建的主要成本是 Agent 阅读。Agent 自行安排工具读取，最后交付一份语义结果。结果超限时明确失败并保留暂存事实，不静默截断。发布门槛要求覆盖全部纳入文件。自动维护依赖受信任的 Hook 与拥有源 thread 的宿主连接；缺少隔离能力时保留待办，手动维护使用当前 v3 接口。
 
 大仓库分别测量文件哈希、TS 项目重分析和高扇出追踪成本。文件浏览保持清单完整，节点导航和路径输出分别遵循各自的预算。
 
@@ -541,7 +505,7 @@ Hook 使用 `./hooks/hooks.json`。Windows 在 Node 中读取 `PLUGIN_ROOT` 并�
 
 ### 16.1 初次构建
 
-用户在 `/` 菜单选择 `code-map-init`。Agent 从清单看到 3 个纳入文件和 2 个排除文件，分批读完纳入文件的源码。Agent 提交文件语义、重点节点定位和 Cluster 归属 JSON，把 3 个文件归入 `C1`。索引器在后台解析与校验，补齐可用的注释，确认完整覆盖后发布 `generation=1`。
+用户选择 `code-map-init`。索引器生成暂存事实和任务。Agent 读取 3 个纳入文件，用已有 ID 一次输出 Cluster、文件和重点节点的语义 JSON。统一写入器校验覆盖、引用和原基线，在事务中发布修订对 `(1,1)`。2 个排除文件不参与任务。
 
 ### 16.2 日常查询
 

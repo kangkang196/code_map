@@ -199,7 +199,7 @@ export function mapTraceNodePaths(input: TraceInput, prepared?: import('./protoc
       }
 
       // Pagination over path_steps; nodes/edges derived from the included steps.
-      const cursorCtx = { workspaceId: v.workspace_id, generation: v.generation, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['trace', input.target_id, direction, maxDepth, relationTypes, maxSteps]) };
+      const cursorCtx = { workspaceId: v.workspace_id, physical_revision: v.physical_revision, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['trace', input.target_id, direction, maxDepth, relationTypes, maxSteps]) };
       const offset = resolveCursorOffset(input.cursor, cursorCtx);
       const base = ctx.envelope({ status: 'ok', freshness, page: { total: 0, returned: 0, has_more: false, next_cursor: null } });
       const nodeById = new Map<string, TraceNode | null>();

@@ -4,6 +4,7 @@ import { openWorkspace, closeWorkspace } from '../workspace/context.js';
 import { discover } from '../workspace/discovery.js';
 import { toRelativePath } from '../workspace/paths.js';
 import { syncForHook } from './sync.js';
+import { SCHEMA_VERSION } from '../storage/database.js';
 
 export function changedPaths(input: unknown, response: unknown): string[] {
   const paths = new Set<string>();
@@ -36,7 +37,7 @@ export async function runPostToolUseHook(): Promise<void> {
     let shouldSync = false;
     try {
       if (ctx.lifecycle.state !== 'ready' || !ctx.db) return;
-      if (ctx.db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value === '2'
+      if (ctx.db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value === String(SCHEMA_VERSION)
         && ctx.db.get('SELECT 1 FROM semantic_tasks WHERE branch_id = ?', event.session_id)) return;
       const relative = paths.flatMap((path) => {
         try { return [toRelativePath(root, isAbsolute(path) ? path : resolve(event.cwd, path))]; } catch { return []; }

@@ -66,23 +66,23 @@ test('malformed, inactive and suspended hooks produce no work or chat output', (
   edit(ws.root);
   assert.deepEqual(hook(ws.root), {});
   assert.deepEqual(hook(ws.root, 'post-tool-use', { tool_name: 'apply_patch', tool_input: '*** Update File: orders/service.py' }), {});
-  assert.equal(sql(ws.root, 'SELECT generation FROM workspace_state')[0].generation, 1);
+  assert.equal(sql(ws.root, 'SELECT physical_revision FROM workspace_state')[0].physical_revision, 1);
 });
 
 test('PostToolUse synchronizes recognized edits and old delete paths, excluding reads and ignored paths', (t) => {
   const ws = buildPublishedWorkspace(); t.after(ws.cleanup);
   edit(ws.root);
   hook(ws.root, 'post-tool-use', { tool_name: 'Bash', tool_input: 'anything' });
-  assert.equal(sql(ws.root, 'SELECT generation FROM workspace_state')[0].generation, 1);
+  assert.equal(sql(ws.root, 'SELECT physical_revision FROM workspace_state')[0].physical_revision, 1);
   hook(ws.root, 'post-tool-use', { tool_name: 'apply_patch', tool_input: { command: '*** Update File: orders/service.py' } });
-  assert.equal(sql(ws.root, 'SELECT generation FROM workspace_state')[0].generation, 2);
+  assert.equal(sql(ws.root, 'SELECT physical_revision FROM workspace_state')[0].physical_revision, 2);
   assert.equal(tasks(ws.root).length, 0);
   writeFileSync(join(ws.root, 'ignored.min.js'), 'ignored');
   hook(ws.root, 'post-tool-use', { tool_name: 'apply_patch', tool_input: '*** Add File: ignored.min.js' });
-  assert.equal(sql(ws.root, 'SELECT generation FROM workspace_state')[0].generation, 2);
+  assert.equal(sql(ws.root, 'SELECT physical_revision FROM workspace_state')[0].physical_revision, 2);
   rmSync(join(ws.root, 'src/util.ts'));
   hook(ws.root, 'post-tool-use', { tool_name: 'apply_patch', tool_response: { files: [{ old_path: 'src/util.ts' }] } });
-  assert.equal(sql(ws.root, 'SELECT generation FROM workspace_state')[0].generation, 3);
+  assert.equal(sql(ws.root, 'SELECT physical_revision FROM workspace_state')[0].physical_revision, 3);
 });
 
 test('default Stop registers one complete worklist without blocking; later Stop retries unavailable work without new edits', (t) => {
@@ -92,7 +92,7 @@ test('default Stop registers one complete worklist without blocking; later Stop 
   assert.deepEqual(hook(ws.root), {});
   assert.equal(latest(ws.root).state, 'pending');
   const worklist = JSON.parse(latest(ws.root).worklist);
-  assert.equal(worklist.schema_version, 2);
+  assert.equal(worklist.schema_version, 3);
   assert.equal(worklist.unassigned_files.length, 25);
   assert.ok(worklist.reviews.length > 0);
   assert.deepEqual(worklist.candidates, []);

@@ -1,6 +1,6 @@
 # Code Map 实施方案
 
-修订于 2026-11-21。M1／M2 工作包保留历史背景；当前维护实现与验收按 [维护方案](index-maintenance-plan.md) 和 [验收记录](index-maintenance-acceptance.md)。[设计方案](design.md) · [原始反馈](../feedback.md) · [核实记录](evidence.md)
+修订于 2026-11-22。初建单任务与统一写入按设计方案和 v3 协议执行。M1／M2 工作包保留历史背景；当前维护实现与验收按 [维护方案](index-maintenance-plan.md) 和 [验收记录](index-maintenance-acceptance.md)。[设计方案](design.md) · [原始反馈](../feedback.md) · [核实记录](evidence.md)
 
 ## 1. 交付目标与实施顺序
 
@@ -61,7 +61,7 @@ src/
     freshness.ts                   内容哈希与查询复核
   index/
     build.ts / reconcile.ts         首次构建、恢复、Node 对齐
-    bootstrap.ts                    源码分批读取、JSON 草稿与发布
+    bootstrap.ts                    初建任务文件、对象引用和输出 schema
     sync.ts / impact.ts             增量事务与影响集合
     coordinates.ts                 行号、UTF-16 与 UTF-8 转换
   adapters/
@@ -97,7 +97,7 @@ dist/                               构建产物；不作为源码真相
 
 M1 使用 MCP。M2 默认包通过 `use-code-map` Skill 调用 `codemap query NAME --root PATH [--input FILE]`。源码保留独立 stdio 接口及原有查询测试。
 
-注册 `map_overview`、`map_browse_files`、`map_inspect_node` 和 `map_trace_node_paths`。协议从版本 1 开始。两个发布版本使用同一查询契约。文件和节点支持批量与单项错误，所有工具共享新鲜度复核。数据库 schema 1 包含 Cluster、语义和维护表。
+注册 `map_overview`、`map_browse_files`、`map_inspect_node` 和 `map_trace_node_paths`。当前协议与数据库 schema 均为 3。文件和节点支持批量与单项错误，所有工具共享新鲜度复核。数据库保留 Cluster、语义、基线和维护表，旧索引升级前备份。
 
 ### 4.2 CLI
 
@@ -106,16 +106,13 @@ M1 使用 MCP。M2 默认包通过 `use-code-map` Skill 调用 `codemap query NA
 | 命令 | 输入与结果 | 写入边界 |
 |---|---|---|
 | `init --root PATH --dry-run` | 预览目录清单、语言、文件数、字节数和排除数 | 只读 |
-| `init --root PATH` | 初建 Skill 预览后建立暂存快照，也用于恢复已暂停工作区 | 启用状态、暂存事实及最小忽略项 |
-| `init --root PATH --next` | 按阶段输出原始源码批次或待分类文件摘要 | 暂存批次与片段标识 |
-| `init --root PATH --submit --input FILE` | 接收版本化初建 JSON，保存阅读回执、语义与归属草稿 | 暂存数据 |
-| `init --root PATH --publish` | 完整性、哈希、成员和重点节点校验后发布首个版本 | 事实、语义、归属同版本发布 |
+| `init --root PATH` | 建立暂存事实，返回完整初建任务及原 base；也用于恢复初建或重新启用工作区 | 启用状态、暂存事实、任务及最小忽略项 |
 | `suspend --root PATH` | 暂停维护，保留索引 | state.json 的 enabled=false |
-| `sync --root PATH` | 已 ready 工作区的确定性增量更新 | 事实图、失效状态及 generation |
-| `sync --root PATH --resume` | 恢复用户明确要求的未完成初建 | 检查点及事实索引 |
+| `sync --root PATH` | 已 ready 工作区的确定性增量更新 | 事实图、失效状态及 physical_revision |
+| `sync --root PATH --resume` | 刷新未发布事实并签发新初建任务与原 base | 暂存事实与任务标识 |
 | `sync --root PATH --rebuild` | 重新构建事实图，重验可复用语义 | 构建库完成后事务切换版本 |
 | `annotate --root PATH --prepare [--scope ID]` | 默认准备增量工作单，可重复指定 Cluster、文件或重点节点 ID | 有界的派生工作单 |
-| `annotate --root PATH --apply --input FILE` | 校验 JSON 版本、证据、语义和文件归属 | 语义、导航、归属和批次状态 |
+| `annotate --root PATH --apply --base BASE --input FILE\|-` | 接收初建语义树或增量操作数组；共用版本、范围、指纹与事务校验 | 初建原子发布，或推进所处理对象的语义基线 |
 | `doctor --root PATH` | 生命周期、运行时、库完整性、覆盖率和维护状态 | 只读诊断 |
 
 M1 交付表中命令，M2 的 Hook 复用 `sync` 和 `annotate`。CLI 的业务 JSON 输出到 stdout，日志和进度到 stderr。退出码 0 表示成功，2 表示参数或协议错误，3 表示状态不允许或发布条件未满足，4 表示基础设施错误，5 表示锁或版本冲突。文件解析问题由 coverage 表达。
@@ -139,21 +136,21 @@ Git 项目初始化时，在根 `.gitignore` 中最小、去重地加入 `.codem
 | W3 TS 适配器 | adapters/typescript | 声明、重载、导入别名、调用绑定、分支与回调位置 | 事实夹具区分实现、声明绑定和未知目标 |
 | W4 Python 适配器 | adapters/python、python-bindings、WASM | 从语法树构建作用域、声明、Region、静态导入和有限直接调用 | 跨文件别名绑定到声明，遮蔽、重赋值和动态目标保留诊断 |
 | W5 构建与增量 | build、reconcile、sync、impact、lease | 首建检查点、恢复、Node 对齐、位置迁移、反向影响和 fencing | 中断恢复结果等于新建；并发旧租约不能提交 |
-| W6 完整初建 | bootstrap、code-map-init Skill、semantics | 目录分批读源码、两阶段 JSON、注释补缺、归属覆盖校验 | 所有纳入文件已读且唯一归属，事实和语义一起发布 |
+| W6 完整初建 | bootstrap、code-map-init Skill、semantics | 单任务读取全部源码、一份层级语义 JSON、统一写入、注释补缺与归属覆盖 | 所有纳入文件已读且唯一归属，事实和语义一起发布 |
 | W7 手动维护 | semantic、cluster 归属、file_highlights | 文件和重点节点依赖指纹、Cluster 复核、归属事务 | 变更向上定位，新增文件可归类，重复补丁幂等 |
 | W8 查询与本地交付 | query、server、skills、打包脚本 | 四工具、批量和分页、共享刷新、本地 marketplace | 初建入口与查询真实可用，批量和并发达到性能门槛 |
 
 W3、W4 通过注册表接入。先固定适配器的输入、统一事实输出、能力和影响范围接口，再实现 TS／JS 与 Python。用测试适配器验证注册新语言时查询协议和数据库表可直接复用。
 
-首建固定文件清单后，事实解析和 Agent 完整阅读分别推进。阅读阶段提交文件语义与重点声明定位，分类阶段按语义草稿提交 Cluster 和归属。覆盖率校验通过后发布 `generation=1`。恢复时重验文件哈希、配置和适配器版本，复用有效草稿与回执。
+首建解析事实并生成任务文件。Agent 用宿主工具读取全部纳入源码，一次提交层级语义树，复用统一写入器并发布修订对 `(1,1)`。恢复时重验当前事实并更换任务与原基线，旧结果被拒绝。
 
 全量重建先写 `.codemap/build/<租约 ID>/index.sqlite`。每个租约使用独立目录，避免过期进程覆盖后续重建。保持旧 active 库可读取；查询返回 INDEX_REFRESHING，旧位置不得作为当前版本证据。新库完成并验证后，用持有 fencing token 的 active 库事务导入事实与身份映射，保留可验证复用的语义；不能用操作系统文件替换绕过 Windows 打开句柄限制。
 
-M1 验收从 `/` 菜单选择 `code-map-init` 或用 `$code-map-init` 显式触发。验证忽略文件不会进入阅读批次，初建结果覆盖全部纳入源码。已知路径直接批量查文件，已知 ID 直接查节点。手动同步一个改动并提交语义复核，验证仅相关文件、节点和 Cluster 入单。
+M1 验收从 `/` 菜单选择 `code-map-init` 或用 `$code-map-init` 显式触发。验证忽略文件不会进入任务范围，初建结果覆盖全部纳入源码。已知路径直接批量查文件，已知 ID 直接查节点。手动同步一个改动并提交语义复核，验证仅相关文件、节点和 Cluster 入单。
 
 M1 发布包不包含生命周期 Hook。它是能独立使用的最小版本，不宣称自动语义维护。
 
-## 6. v0.3 维护协议 v2
+## 6. 当前维护协议 v3
 
 | 阶段 | 实现 | 验收重点 |
 |---|---|---|
@@ -173,7 +170,7 @@ M1 发布包不包含生命周期 Hook。它是能独立使用的最小版本，
 | `npm run typecheck` | TypeScript 全量类型检查 |
 | `npm test` | 解析、坐标、身份、增量、存储、语义单元与集成 |
 | `npm run test:mcp` | 真实 stdio initialize、tools/list、tools/call、schema 与错误 |
-| `npm run test:lifecycle` | 状态机、完整阅读回执、JSON 校验、覆盖、恢复和暂停 |
+| `npm run test:lifecycle` | 状态机、单份 JSON、覆盖、恢复、基线绑定和暂停 |
 | `npm run test:hooks` | Node 驱动 stdin／stdout 事件重放及状态机 |
 | `npm run build` | 生成 server、CLI、Hook 入口及运行依赖 |
 | `npm run validate:plugin` | 官方清单 schema、路径边界、引用文件、许可和包内容 |
@@ -191,9 +188,9 @@ M1 发布包不包含生命周期 Hook。它是能独立使用的最小版本，
 |---|---|---|
 | 不需要建图 | 纯文档、研究、空目录、混合资料目录；插件已装但未启用 | 无 .codemap，无全库扫描，无语义调用，无 Stop 续跑 |
 | 首次构建 | 英文入口、仅预览、无 Git、ignore、长文件、解析失败和空目录 | 预览零写入，逐段读完所有纳入源码，忽略内容不进入 Agent 上下文 |
-| 初建 JSON 与恢复 | 漏片段、旧哈希、重复批次、声明歧义、注释补缺、构建中断 | 复用有效回执，拒绝旧批次和歧义，覆盖完整后发布 |
+| 初建 JSON 与恢复 | 漏文件、重复归属、跨文件节点、过期任务、注释补缺、写入失败 | 一次提交，共用写入器，错误整份回滚，完整覆盖后原子发布 |
 | Cluster 覆盖 | 跨目录分组、重复或漏归属、新增、删除、迁移和空组 | 首建全量唯一覆盖，增量可定位待归类和受影响的源／目标 Cluster |
-| 构建期间查询 | generation=0、已有旧版本重建 | 明确 INDEX_BUILDING 或 stale；不返回伪当前行号 |
+| 构建期间查询 | physical_revision=0、已有旧版本重建 | 明确 INDEX_BUILDING 或 stale；不返回伪当前行号 |
 | 声明与身份 | 重名、嵌套、重载、声明合并、箭头函数、复制与移动 | 唯一匹配保留 ID；歧义时不错误合并 |
 | 坐标 | LF／CRLF、BOM、中文、emoji、装饰器、首尾边界 | 行号与 UTF-8 范围均切出正确源码 |
 | Region | 条件、循环、try、匿名回调、内部语句与独立函数 | Region 不越界；调用位置与定义不混淆 |
@@ -230,7 +227,7 @@ M1 发布包不包含生命周期 Hook。它是能独立使用的最小版本，
 | 无变化、8 并发且清单校验过期的首屏 P95 | 不超过 2 秒 | 不超过 7 秒 |
 | Node 进程峰值 RSS | 不超过 1.5 GiB | 不超过 3 GiB |
 
-v2 每次请求或同批请求完整校验，计入排队、全清单哈希、查询和序列化；不再依赖一秒缓存。并发混合负载交替调用文件详情、节点检查和概览。冷复核统计完整等待时间及实际扫描次数，每进程同一轮仅一次。每项预热 3 轮、至少 20 轮测量。记录超时、限流和错误率。夹具 A 的验收负载内全部请求成功，降级结果单独统计。修改后的同步和首次 Agent 阅读耗时分别记录。
+v3 每次请求或同批请求完整校验，计入排队、全清单哈希、查询和序列化；不再依赖一秒缓存。并发混合负载交替调用文件详情、节点检查和概览。冷复核统计完整等待时间及实际扫描次数，每进程同一轮仅一次。每项预热 3 轮、至少 20 轮测量。记录超时、限流和错误率。夹具 A 的验收负载内全部请求成功，降级结果单独统计。修改后的同步和首次 Agent 阅读耗时分别记录。
 
 B 是规模验证目标。发布时按实际通过的规模标记支持范围。文件浏览的性能优化须保持清单完整。多跳追踪单独记录分支数、步数、分页和截断开销。
 

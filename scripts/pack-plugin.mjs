@@ -64,6 +64,7 @@ try {
     'README.md', 'LICENSE', 'feedback.md',
     'docs/design.md', 'docs/implementation-plan.md', 'docs/evidence.md',
     'docs/m1-acceptance.md', 'docs/m2-acceptance.md', 'docs/index-maintenance-plan.md', 'docs/index-maintenance-acceptance.md',
+    'docs/initial-build-acceptance.md',
   ];
   for (const f of copyFiles) {
     const source = join(root, f);

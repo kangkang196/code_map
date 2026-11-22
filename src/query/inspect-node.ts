@@ -197,7 +197,7 @@ export function mapInspectNode(input: InspectNodeInput, prepared?: import('./pro
           const page = { total: 1, returned: 1, has_more: false, next_cursor: null };
           return { ...ctx.envelope({ status: 'ok', freshness, page }), mode: 'query', focus: detail! } as InspectNodeResult;
         }
-        const cursorCtx = { workspaceId: v.workspace_id, generation: v.generation, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['inspect-candidates', input.query, input.file_id ?? null]) };
+        const cursorCtx = { workspaceId: v.workspace_id, physical_revision: v.physical_revision, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['inspect-candidates', input.query, input.file_id ?? null]) };
         const offset = resolveCursorOffset(input.cursor, cursorCtx);
         const base = { mode: 'query' };
         const envelope = ctx.envelope({ status: 'candidates', freshness, page: { total: 0, returned: 0, has_more: false, next_cursor: null } });
@@ -209,7 +209,7 @@ export function mapInspectNode(input: InspectNodeInput, prepared?: import('./pro
       // batch target_ids
       const ids = input.target_ids!;
       if (ids.length < 1 || ids.length > BATCH_LIMIT) throw new QueryError('INVALID_ARGUMENT', `batch size must be 1-${BATCH_LIMIT}`, 2);
-      const cursorCtx = { workspaceId: v.workspace_id, generation: v.generation, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['inspect-batch', ids]) };
+      const cursorCtx = { workspaceId: v.workspace_id, physical_revision: v.physical_revision, semanticRevision: v.semantic_revision, fingerprint: inputFingerprint(['inspect-batch', ids]) };
       const offset = resolveCursorOffset(input.cursor, cursorCtx);
       const seen = new Set<string>();
       const ordered = ids.filter((k) => (seen.has(k) ? false : (seen.add(k), true)));

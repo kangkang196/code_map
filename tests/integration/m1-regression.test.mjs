@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runCli, buildPublishedWorkspace } from '../helpers/workspace.mjs';
+import { runCli, buildPublishedWorkspace, initialResult } from '../helpers/workspace.mjs';
 import { mapInspectNode } from '../../dist/query/inspect-node.js';
 import { mapOverview } from '../../dist/query/overview.js';
 import { mapTraceNodePaths } from '../../dist/query/trace-node-paths.js';
@@ -32,15 +32,12 @@ function git(root, ...args) {
 
 function prepareRead(root) {
   writeFileSync(join(root, 'x.ts'), 'export function x() { return 1; }\n');
-  success(cli(root, 'init'));
-  return success(cli(root, 'init', '--next'));
+  const initialized = success(cli(root, 'init'));
+  return JSON.parse(readFileSync(initialized.task_file, 'utf8'));
 }
 
-function submit(root, batch, values) {
-  const { schema_version, bootstrap_id, manifest_hash, batch_id, phase } = batch;
-  const path = join(root, '.codemap', 'submit.json');
-  writeFileSync(path, JSON.stringify({ schema_version, bootstrap_id, manifest_hash, batch_id, phase, ...values }));
-  return cli(root, 'init', '--submit', '--input', path);
+function submit(root, task, result = initialResult(task)) {
+  return runCli(['annotate', '--root', root, '--apply', '--base', task.base, '--input', '-'], { input: JSON.stringify(result) });
 }
 
 test('full rebuild imports a staged database atomically while old read handles stay valid', (t) => {
@@ -51,7 +48,7 @@ test('full rebuild imports a staged database atomically while old read handles s
   const writer = new DatabaseSync(index);
   const reader = new DatabaseSync(index, { readOnly: true });
   try {
-    const getVersion = () => reader.prepare('SELECT generation FROM workspace_state').get().generation;
+    const getVersion = () => reader.prepare('SELECT physical_revision FROM workspace_state').get().physical_revision;
     const old = mapInspectNode({ root, query: 'create_order' }).focus;
     assert.equal(getVersion(), 1);
     reader.exec('BEGIN DEFERRED');
@@ -60,12 +57,12 @@ test('full rebuild imports a staged database atomically while old read handles s
     const failure = cli(root, 'sync', '--rebuild');
     assert.notEqual(failure.code, 0);
     assert.match(failure.json.error.message, /injected import failure/);
-    assert.equal(writer.prepare('SELECT generation FROM workspace_state').get().generation, 1);
+    assert.equal(writer.prepare('SELECT physical_revision FROM workspace_state').get().physical_revision, 1);
     assert.equal(mapInspectNode({ root, target_id: old.node_id }).focus.semantics.purpose, old.semantics.purpose);
     writer.exec('DROP TRIGGER reject_rebuild');
     const rebuilt = success(cli(root, 'sync', '--rebuild'));
     assert.equal(rebuilt.status, 'rebuilt');
-    assert.equal(rebuilt.generation, 2);
+    assert.equal(rebuilt.physical_revision, 2);
     assert.equal(getVersion(), 1);
     reader.exec('COMMIT');
     assert.equal(getVersion(), 2);
@@ -106,8 +103,8 @@ test('nested ignore stays local in a workspace without Git', (t) => {
   writeFileSync(join(root, 'private.ts'), 'export const visible = true;');
   writeFileSync(join(root, 'pkg', 'private.ts'), 'export const secret = true;');
   writeFileSync(join(root, 'pkg', '.gitignore'), '/private.ts\n');
-  const batch = (success(cli(root, 'init')), success(cli(root, 'init', '--next')));
-  assert.deepEqual(batch.items.map((i) => i.path), ['private.ts']);
+  const task = JSON.parse(readFileSync(success(cli(root, 'init')).task_file, 'utf8'));
+  assert.deepEqual(task.files.map((i) => i.path), ['private.ts']);
 });
 
 test('a tracked path through a junction is excluded, and a junction cannot host the index', (t) => {
@@ -130,7 +127,8 @@ test('a tracked path through a junction is excluded, and a junction cannot host 
 
 test('empty and inactive continuation leave no state; inactive query cannot migrate an orphan database', (t) => {
   const root = workspace(t);
-  assert.equal(cli(root, 'init', '--next').json.error.code, 'NOT_ENABLED');
+  assert.equal(cli(root, 'init', '--next').json.error.code, 'INVALID_ARGUMENT');
+  assert.equal(cli(root, 'annotate', '--apply', '--base', 'forged', '--input', '-').json.error.code, 'INDEX_NOT_READY');
   assert.equal(cli(root, 'init').json.error.code, 'NO_SOURCE_FILES');
   assert.equal(existsSync(join(root, '.codemap')), false);
   mkdirSync(join(root, '.codemap'));
@@ -140,28 +138,17 @@ test('empty and inactive continuation leave no state; inactive query cannot migr
   assert.equal(readFileSync(db).length, 0);
 });
 
-test('issued bootstrap batches bind bytes and receipt, and publish rechecks the manifest', (t) => {
+test('initial results bind one immutable task and reject changed source or configuration', (t) => {
   const root = workspace(t);
-  const read = prepareRead(root);
-  const receipt = { read_chunk_ids: read.items.map((i) => i.chunk_id), files: [{ path: 'x.ts', file_hash: read.items[0].file_hash, purpose: 'X', content: 'One function' }] };
-  assert.equal(submit(root, { ...read, batch_id: 'forged' }, receipt).json.error.code, 'UNKNOWN_BATCH');
-  assert.equal(success(submit(root, read, receipt)).applied, true);
-  assert.equal(success(submit(root, read, receipt)).applied, false);
-  const classify = success(cli(root, 'init', '--next'));
-  success(submit(root, classify, { clusters: [{ key: 'x', name: 'X', purpose: 'X' }], assignments: [{ path: 'x.ts', cluster_key: 'x' }] }));
+  const task = prepareRead(root);
   writeFileSync(join(root, 'x.ts'), '\nexport function x() { return 2; }\n');
-  assert.equal(cli(root, 'init', '--publish').json.error.code, 'MANIFEST_STALE');
-  success(cli(root, 'sync', '--resume'));
-  const freshRead = success(cli(root, 'init', '--next'));
-  assert.notEqual(freshRead.items[0].file_hash, read.items[0].file_hash);
-  assert.match(freshRead.items[0].source, /return 2/);
-});
-
-test('source changes before a read cannot be delivered under an old hash', (t) => {
-  const root = workspace(t);
-  prepareRead(root);
-  appendFileSync(join(root, 'x.ts'), '\nexport const y = 2;\n');
-  assert.equal(cli(root, 'init', '--next').json.error.code, 'FILE_HASH_STALE');
+  assert.equal(submit(root, task).json.error.code, 'INDEX_STALE');
+  const resumed = success(cli(root, 'sync', '--resume'));
+  const fresh = JSON.parse(readFileSync(resumed.task_file, 'utf8'));
+  assert.notEqual(fresh.bootstrap_id, task.bootstrap_id);
+  assert.equal(submit(root, task).json.error.code, 'VERSION_CONFLICT');
+  writeFileSync(join(root, '.codemap.json'), '{"exclude":["x.ts"]}');
+  assert.equal(submit(root, fresh).json.error.code, 'INDEX_STALE');
 });
 
 test('query location is verified even with a hot cache; copied state and suspended writes are rejected', (t) => {

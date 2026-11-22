@@ -13,7 +13,7 @@ test('the query CLI runs the four existing query contracts', (t) => {
     writeFileSync(input, JSON.stringify(params));
     const result = runCli(['query', name, '--root', ws.root, '--input', input]);
     assert.equal(result.code, 0, result.stdout + result.stderr);
-    assert.equal(result.json.physical_index.generation, 1);
+    assert.equal(result.json.physical_index.physical_revision, 1);
     assert.equal(result.json.physical_index.status, 'valid');
     assert.ok(Buffer.byteLength(result.stdout) <= (params.max_bytes ?? 24 * 1024));
     return result.json;

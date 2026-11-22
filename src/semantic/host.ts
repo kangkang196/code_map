@@ -67,7 +67,7 @@ export class MaintenanceAdapter {
       if (!task || db.get("SELECT 1 FROM semantic_tasks WHERE state IN ('running','awaiting_result')")) return;
       worklist = JSON.parse(task.worklist) as Worklist;
       const ws = readWorkspaceState(db)!;
-      if (ws.generation !== worklist.base_generation || ws.semantic_revision !== worklist.base_semantic_revision) {
+      if (ws.physical_revision !== worklist.base_physical_revision || ws.semantic_revision !== worklist.base_semantic_revision) {
         db.run("UPDATE semantic_tasks SET state = 'superseded', updated_at = ? WHERE worklist_id = ?", Date.now(), worklist.worklist_id);
         return;
       }
@@ -87,7 +87,7 @@ export class MaintenanceAdapter {
       const claimed = claim.db.transaction(() => {
         if (claim.db!.get("SELECT 1 FROM semantic_tasks WHERE state IN ('running','awaiting_result')")) return false;
         const ws = readWorkspaceState(claim.db!)!;
-        if (ws.generation !== worklist.base_generation || ws.semantic_revision !== worklist.base_semantic_revision) return false;
+        if (ws.physical_revision !== worklist.base_physical_revision || ws.semantic_revision !== worklist.base_semantic_revision) return false;
         return Boolean(claim.db!.get("UPDATE semantic_tasks SET state = 'running', updated_at = ? WHERE worklist_id = ? AND state = 'pending' RETURNING worklist_id", Date.now(), worklist.worklist_id));
       });
       if (!claimed) return;

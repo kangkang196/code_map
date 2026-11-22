@@ -56,14 +56,14 @@ test('suspend gates queries with INDEX_SUSPENDED and preserves the index', () =>
   assert.equal(queryCode(ws.root), 'INDEX_SUSPENDED');
   // Index file is preserved.
   assert.ok(readFileSync(join(ws.root, '.codemap', 'state.json')).length > 0);
-  // Re-init resumes (re-enables) without losing the published generation.
+  // Re-init resumes (re-enables) without losing the published physical_revision.
   const reinit = runCli(['init', '--root', ws.root]);
   assert.equal(reinit.code, 0, reinit.stderr);
   assert.equal(reinit.json.already_ready, true);
   assert.equal(queryCode(ws.root), 'ok');
 });
 
-test('sync bumps generation on edit, marks review and creates work items; no-op stays unchanged', () => {
+test('sync bumps physical_revision on edit, marks review and creates work items; no-op stays unchanged', () => {
   const ws = buildPublishedWorkspace();
   cleanups.push(ws.cleanup);
 
@@ -77,16 +77,16 @@ test('sync bumps generation on edit, marks review and creates work items; no-op 
   const sync = runCli(['sync', '--root', ws.root]);
   assert.equal(sync.code, 0, sync.stdout + sync.stderr);
   assert.equal(sync.json.status, 'synced');
-  assert.equal(sync.json.generation, 2);
+  assert.equal(sync.json.physical_revision, 2);
   assert.equal(sync.json.changed, 1);
   assert.ok(sync.json.workItems >= 1, 'edit should create at least one work item');
   assert.ok(sync.json.impact.fileIds.length >= 1);
 
-  // A second sync with no disk change is a no-op and keeps the generation.
+  // A second sync with no disk change is a no-op and keeps the physical_revision.
   const noop = runCli(['sync', '--root', ws.root]);
   assert.equal(noop.code, 0, noop.stderr);
   assert.equal(noop.json.status, 'unchanged');
-  assert.equal(noop.json.generation, 2);
+  assert.equal(noop.json.physical_revision, 2);
 });
 
 function apply(root, base, operations, input = '-') {
@@ -107,7 +107,7 @@ function editedWorkspace() {
 test('v2 partial operations advance only their object baseline and replay canonically', () => {
   const ws = editedWorkspace();
   const prepared = runCli(['annotate', '--root', ws.root, '--prepare']).json;
-  assert.equal(prepared.schema_version, 2);
+  assert.equal(prepared.schema_version, 3);
   assert.ok(prepared.reviews.length >= 2);
   const target = prepared.reviews.find((r) => r.kind === 'node');
   const operations = [{ op: 'node', id: target.id, purpose: '更新后的节点职责' }];
@@ -127,7 +127,7 @@ test('line movement and a reverted edit leave no semantic work, including deleti
   const path = join(ws.root, 'orders', 'service.py');
   const original = readFileSync(path, 'utf8');
   writeFileSync(path, '\n\n' + original);
-  assert.equal(runCli(['sync', '--root', ws.root]).json.generation, 2);
+  assert.equal(runCli(['sync', '--root', ws.root]).json.physical_revision, 2);
   assert.equal(runCli(['annotate', '--root', ws.root, '--prepare']).json.reviews.length, 0);
   const tsPath = join(ws.root, 'src', 'orders.ts');
   writeFileSync(tsPath, '\n\n' + readFileSync(tsPath, 'utf8'));

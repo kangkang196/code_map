@@ -40,7 +40,6 @@ test('schema upgrade keeps a consistent v1 backup and does not infer file import
   old.run("INSERT INTO files (file_id, path, file_hash, language) VALUES ('f', 'a.ts', 'hash', 'typescript')");
   old.run("INSERT INTO semantics (node_id, purpose) VALUES ('f', 'legacy purpose')");
   old.db.exec(`ALTER TABLE files DROP COLUMN important;
-    ALTER TABLE bootstrap_file_drafts DROP COLUMN important;
     DROP TABLE semantic_baselines; DROP TABLE semantic_tasks;
     UPDATE meta SET value = '1' WHERE key = 'schema_version'`);
   old.close();
@@ -49,7 +48,7 @@ test('schema upgrade keeps a consistent v1 backup and does not infer file import
   assert.throws(() => upgraded.upgrade(), LeaseConflict);
   releaseLease(upgraded, active);
   upgraded.upgrade();
-  assert.equal(upgraded.get("SELECT value FROM meta WHERE key = 'schema_version'").value, '2');
+  assert.equal(upgraded.get("SELECT value FROM meta WHERE key = 'schema_version'").value, '3');
   assert.equal(upgraded.get('SELECT important FROM files').important, 0);
   assert.equal(semanticSnapshot(upgraded).get('file:f').semantics.status, 'not_selected');
   upgraded.upgrade(); upgraded.close();

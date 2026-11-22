@@ -7,7 +7,7 @@ import { configFingerprint, discover, discoverAsync, hashFile, type DiscoveryCon
 import { managedPath, toProtocolPath } from '../workspace/paths.js';
 import { isAbsolute } from 'node:path';
 import { enablementHint } from '../workspace/lifecycle.js';
-import { PROTOCOL_VERSION } from '../storage/database.js';
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from '../storage/database.js';
 import { DEFAULT_ADAPTER_FINGERPRINT } from '../adapters/versions.js';
 import { LeaseConflict } from '../storage/lease.js';
 import { submissionBase } from '../semantic/base.js';
@@ -59,7 +59,7 @@ export interface PageInfo {
 export interface CommonOutput {
   schema_version: number;
   workspace_id: string;
-  physical_index: { status: 'valid'; generation: number };
+  physical_index: { status: 'valid'; physical_revision: number };
   base: string;
   semantic_revision: number;
   status: QueryStatus;
@@ -200,7 +200,7 @@ export class QueryContext {
   static open(root: string, prepared?: PreparedFreshness): QueryContext {
     if (typeof root !== 'string' || !isAbsolute(root)) throw new QueryError('INVALID_ARGUMENT', 'root must be an absolute path', 2);
     let ws = openWorkspace(root);
-    if (ws.lifecycle.state === 'ready' && ws.db?.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value === '1') {
+    if (ws.lifecycle.state === 'ready' && ws.db && Number(ws.db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value ?? 1) < SCHEMA_VERSION) {
       closeWorkspace(ws);
       try { ws = openWorkspace(root, true); }
       catch (err) {
@@ -224,7 +224,7 @@ export class QueryContext {
       case 'suspended':
         throw new QueryError('INDEX_SUSPENDED', 'workspace is suspended; run init to resume', 3, 'codemap init --root <path>');
       case 'building':
-        throw new QueryError('INDEX_BUILDING', 'initial build in progress', 3, 'codemap init --root <path> --publish');
+        throw new QueryError('INDEX_BUILDING', 'initial build in progress', 3, 'complete the initial task and use annotate --apply with its original base');
       case 'incomplete':
         throw new QueryError('INDEX_NOT_READY', 'initial build incomplete', 3, 'codemap sync --root <path> --resume');
       case 'ready':
@@ -232,9 +232,9 @@ export class QueryContext {
     }
   }
 
-  version(): { workspace_id: string; generation: number; semantic_revision: number } {
-    const row = this.db.get<{ workspace_id: string; generation: number; semantic_revision: number }>(
-      'SELECT workspace_id, generation, semantic_revision FROM workspace_state LIMIT 1',
+  version(): { workspace_id: string; physical_revision: number; semantic_revision: number } {
+    const row = this.db.get<{ workspace_id: string; physical_revision: number; semantic_revision: number }>(
+      'SELECT workspace_id, physical_revision, semantic_revision FROM workspace_state LIMIT 1',
     );
     if (!row) throw new QueryError('INDEX_NOT_READY', 'workspace state missing', 3);
     return row;
@@ -270,9 +270,9 @@ export class QueryContext {
       "SELECT 1 FROM meta m JOIN write_lease l ON l.id = 1 AND l.owner_nonce = m.value WHERE m.key = 'rebuild_owner' AND l.expires_at > ?",
       Date.now(),
     );
-    const { workspace_id, generation, semantic_revision } = this.version();
+    const { workspace_id, physical_revision, semantic_revision } = this.version();
     const config = configFingerprint(this.ws.config);
-    const version = JSON.stringify([workspace_id, generation, semantic_revision, stored?.manifest_hash, config]);
+    const version = JSON.stringify([workspace_id, physical_revision, semantic_revision, stored?.manifest_hash, config]);
     const snapshot: FreshnessSnapshot = {
       root: this.ws.root, version, config: this.ws.config,
       manifestHash: stored?.manifest_hash ?? null, matchesConfig: stored?.config_fingerprint === config && stored?.adapter_fingerprint === DEFAULT_ADAPTER_FINGERPRINT,
@@ -338,7 +338,7 @@ export class QueryContext {
     return {
       schema_version: PROTOCOL_VERSION,
       workspace_id: v.workspace_id,
-      physical_index: { status: 'valid', generation: v.generation },
+      physical_index: { status: 'valid', physical_revision: v.physical_revision },
       base: submissionBase(v),
       semantic_revision: v.semantic_revision,
       status: opts.status,
@@ -358,7 +358,7 @@ export { inputFingerprint, decodeCursor, type CursorPayload };
 
 export interface CursorContext {
   workspaceId: string;
-  generation: number;
+  physical_revision: number;
   semanticRevision: number;
   fingerprint: string;
 }
@@ -368,7 +368,7 @@ export function resolveCursorOffset(cursor: string | undefined, ctx: CursorConte
   if (!cursor) return 0;
   const payload = decodeCursor(cursor);
   if (!payload) throw new QueryError('CURSOR_EXPIRED', 'cursor is malformed', 2, 'restart the query without a cursor');
-  if (payload.workspaceId !== ctx.workspaceId || payload.generation !== ctx.generation || payload.semanticRevision !== ctx.semanticRevision || payload.inputFingerprint !== ctx.fingerprint) {
+  if (payload.workspaceId !== ctx.workspaceId || payload.physical_revision !== ctx.physical_revision || payload.semanticRevision !== ctx.semanticRevision || payload.inputFingerprint !== ctx.fingerprint) {
     throw new QueryError('CURSOR_EXPIRED', 'cursor does not match the current version or parameters', 2, 'restart the query');
   }
   return Math.max(0, payload.offset);
@@ -397,7 +397,7 @@ export function fitItems<T>(opts: {
     const consumed = offset + count;
     const hasMore = consumed < items.length;
     const nextCursor = hasMore
-      ? encodeCursor({ workspaceId: ctx.workspaceId, generation: ctx.generation, semanticRevision: ctx.semanticRevision, inputFingerprint: ctx.fingerprint, offset: consumed, lastSortKey: count ? sortKeyOf(items[consumed - 1]!, consumed - 1) : '' })
+      ? encodeCursor({ workspaceId: ctx.workspaceId, physical_revision: ctx.physical_revision, semanticRevision: ctx.semanticRevision, inputFingerprint: ctx.fingerprint, offset: consumed, lastSortKey: count ? sortKeyOf(items[consumed - 1]!, consumed - 1) : '' })
       : null;
     return { total: items.length, returned: count, has_more: hasMore, next_cursor: nextCursor };
   };

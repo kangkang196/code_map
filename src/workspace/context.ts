@@ -66,13 +66,15 @@ export interface WorkspaceContext {
 }
 
 export function readWorkspaceRow(db: Database, state: StateFile) {
-  const row = db.get<{ generation: number; semantic_revision: number; build_status: string; root_path: string; workspace_id: string }>(
-    'SELECT generation, semantic_revision, build_status, root_path, workspace_id FROM workspace_state LIMIT 1',
+  const row = db.get<{ physical_revision?: number; generation?: number; semantic_revision: number; build_status: string; root_path: string; workspace_id: string }>(
+    'SELECT * FROM workspace_state LIMIT 1',
   );
   if (row && (row.workspace_id !== state.workspace_id || row.root_path !== state.root)) {
     throw new PathError('WORKSPACE_MISMATCH', 'Code Map database belongs to a different workspace');
   }
-  return row ?? null;
+  if (!row) return null;
+  return { workspace_id: row.workspace_id, root_path: row.root_path, physical_revision: row.physical_revision ?? row.generation ?? 0,
+    semantic_revision: row.semantic_revision, build_status: row.build_status };
 }
 
 /**

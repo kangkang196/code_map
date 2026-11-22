@@ -39,12 +39,12 @@ test('tools/list exposes the four query tools', async () => {
   }
 });
 
-test('map_overview returns clusters at generation 1', async () => {
+test('map_overview returns clusters at physical_revision 1', async () => {
   const res = await client.callTool({ name: 'map_overview', arguments: { root: ws.root } });
   assert.ok(!res.isError, payload(res));
   const data = payload(res);
-  assert.equal(data.schema_version, 2);
-  assert.equal(data.physical_index.generation, 1);
+  assert.equal(data.schema_version, 3);
+  assert.equal(data.physical_index.physical_revision, 1);
   assert.equal(data.status, 'ok');
   assert.equal(data.items.length, 1);
   assert.equal(data.items[0].member_count, 5);
@@ -119,7 +119,7 @@ test('stdio queries automatically synchronize source edits through the shared qu
   const path = join(ws.root, 'orders', 'service.py');
   writeFileSync(path, readFileSync(path, 'utf8').replace('def create_order(request):', 'def create_order(request, dry_run=False):'));
   const result = payload(await client.callTool({ name: 'map_inspect_node', arguments: { root: ws.root, query: 'create_order' } }));
-  assert.equal(result.physical_index.generation, 2);
+  assert.equal(result.physical_index.physical_revision, 2);
   assert.equal(result.focus.semantics.status, 'needs_review');
   assert.equal(result.semantic_revision, 1);
 });

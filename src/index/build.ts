@@ -1,5 +1,5 @@
 // Initial build orchestration: enable a workspace, discover the manifest, parse facts and
-// stage the bootstrap snapshot. Publishing (generation=1) lives in bootstrap.ts.
+// stage the bootstrap snapshot. Publication uses the shared semantic writer.
 
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -9,7 +9,7 @@ import { acquireLease, assertLeaseValid, releaseLease, type LeaseHandle } from '
 import { readWorkspaceRow, loadConfig } from '../workspace/context.js';
 import { createDefaultRegistry, adapterFingerprint, type AdapterRegistry } from '../adapters/index.js';
 import { findTsConfig } from '../adapters/typescript.js';
-import { discover, discoverAsync, configFingerprint, type DiscoveryConfig, type Manifest, type ManifestFile } from '../workspace/discovery.js';
+import { discover, discoverAsync, configFingerprint, type DiscoveryConfig, type Manifest } from '../workspace/discovery.js';
 import { canonicalRoot } from '../workspace/paths.js';
 import {
   createState,
@@ -37,7 +37,7 @@ export function upsertWorkspaceState(
   row: {
     workspaceId: string;
     rootPath: string;
-    generation?: number;
+    physical_revision?: number;
     semanticRevision?: number;
     buildStatus?: string;
     manifestHash?: string | null;
@@ -49,12 +49,12 @@ export function upsertWorkspaceState(
   const now = Date.now();
   if (!existing) {
     db.run(
-      `INSERT INTO workspace_state (workspace_id, root_path, schema_version, generation, semantic_revision, build_status, manifest_hash, config_fingerprint, adapter_fingerprint, updated_at)
+      `INSERT INTO workspace_state (workspace_id, root_path, schema_version, physical_revision, semantic_revision, build_status, manifest_hash, config_fingerprint, adapter_fingerprint, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       row.workspaceId,
       row.rootPath,
       SCHEMA_VERSION,
-      row.generation ?? 0,
+      row.physical_revision ?? 0,
       row.semanticRevision ?? 0,
       row.buildStatus ?? 'building',
       row.manifestHash ?? null,
@@ -72,7 +72,7 @@ export function upsertWorkspaceState(
       params.push(val);
     }
   };
-  maybe('generation', row.generation);
+  maybe('physical_revision', row.physical_revision);
   maybe('semantic_revision', row.semanticRevision);
   maybe('build_status', row.buildStatus);
   maybe('manifest_hash', row.manifestHash);
@@ -85,7 +85,7 @@ export function upsertWorkspaceState(
 export function readWorkspaceState(db: Database): {
   workspace_id: string;
   root_path: string;
-  generation: number;
+  physical_revision: number;
   semantic_revision: number;
   build_status: string;
   manifest_hash: string | null;
@@ -96,7 +96,7 @@ export function readWorkspaceState(db: Database): {
     db.get<{
       workspace_id: string;
       root_path: string;
-      generation: number;
+      physical_revision: number;
       semantic_revision: number;
       build_status: string;
       manifest_hash: string | null;
@@ -189,7 +189,7 @@ export interface BuildFactsResult {
   timingMs: { discover: number; parseAndBind: number; verify: number; write: number };
 }
 
-/** Discover, parse and write the full fact graph at generation 0 (building). */
+/** Discover, parse and write the full fact graph at physical_revision 0 (building). */
 export async function buildFacts(env: BuildEnvironment, opts: { reuse?: boolean; manifest?: Manifest; stage?: (manifest: Manifest) => void } = {}): Promise<BuildFactsResult> {
   const started = performance.now();
   const manifest = opts.manifest ?? await discoverAsync(env.root, env.config);
@@ -227,7 +227,6 @@ export async function buildFacts(env: BuildEnvironment, opts: { reuse?: boolean;
       configFingerprint: env.configFingerprint,
       adapterFingerprint: env.adapterFingerprint,
     });
-    storeManifest(env.db, manifest.files);
     storeParserContext(env.db, manifest);
     opts.stage?.(manifest);
     return {
@@ -251,26 +250,10 @@ export function storeParserContext(db: Database, manifest: Manifest): void {
   db.run("INSERT INTO meta (key, value) VALUES ('manifest_excluded', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", String(manifest.excludedCount));
 }
 
-/** Persist the staged manifest used by bootstrap reading and coverage validation. */
-export function storeManifest(db: Database, files: ManifestFile[]): void {
-  db.transaction(() => {
-    db.run('DELETE FROM bootstrap_manifest');
-    for (const f of files) {
-      db.run(
-        'INSERT INTO bootstrap_manifest (path, file_hash, language, byte_size) VALUES (?, ?, ?, ?)',
-        f.path,
-        f.fileHash,
-        f.language,
-        f.byteSize,
-      );
-    }
-  });
-}
-
 export function workspaceName(root: string): string {
   return basename(canonicalRoot(root)) || root;
 }
 
 export function newBootstrapId(): string {
-  return `B-${randomUUID().slice(0, 8)}`;
+  return `B-${randomUUID()}`;
 }

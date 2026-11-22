@@ -101,7 +101,7 @@ export function ensureGitignore(root: string): { added: boolean; path: string | 
 export interface LifecycleInfo {
   state: LifecycleState;
   workspaceId: string | null;
-  generation: number;
+  physical_revision: number;
   semanticRevision: number;
   buildStatus: string | null;
 }
@@ -112,28 +112,28 @@ export interface LifecycleInfo {
  */
 export function resolveLifecycle(
   root: string,
-  dbRow: { generation: number; semantic_revision: number; build_status: string } | null,
+  dbRow: { physical_revision: number; semantic_revision: number; build_status: string } | null,
 ): LifecycleInfo {
   const state = readState(root);
   if (!state) {
-    return { state: 'inactive', workspaceId: null, generation: 0, semanticRevision: 0, buildStatus: null };
+    return { state: 'inactive', workspaceId: null, physical_revision: 0, semanticRevision: 0, buildStatus: null };
   }
   if (!state.enabled) {
     return {
       state: 'suspended',
       workspaceId: state.workspace_id,
-      generation: dbRow?.generation ?? 0,
+      physical_revision: dbRow?.physical_revision ?? 0,
       semanticRevision: dbRow?.semantic_revision ?? 0,
       buildStatus: dbRow?.build_status ?? null,
     };
   }
   if (!dbRow) {
-    return { state: 'incomplete', workspaceId: state.workspace_id, generation: 0, semanticRevision: 0, buildStatus: null };
+    return { state: 'incomplete', workspaceId: state.workspace_id, physical_revision: 0, semanticRevision: 0, buildStatus: null };
   }
   let lifecycle: LifecycleState;
   switch (dbRow.build_status) {
     case 'ready':
-      lifecycle = dbRow.generation >= 1 ? 'ready' : 'incomplete';
+      lifecycle = dbRow.physical_revision >= 1 ? 'ready' : 'incomplete';
       break;
     case 'building':
       lifecycle = 'building';
@@ -142,12 +142,12 @@ export function resolveLifecycle(
       lifecycle = 'incomplete';
       break;
     default:
-      lifecycle = dbRow.generation >= 1 ? 'ready' : 'incomplete';
+      lifecycle = dbRow.physical_revision >= 1 ? 'ready' : 'incomplete';
   }
   return {
     state: lifecycle,
     workspaceId: state.workspace_id,
-    generation: dbRow.generation,
+    physical_revision: dbRow.physical_revision,
     semanticRevision: dbRow.semantic_revision,
     buildStatus: dbRow.build_status,
   };

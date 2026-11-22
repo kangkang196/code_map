@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 // Deterministic incremental sync, full rebuild and bootstrap resume.
 //
 // Sync re-discovers the manifest, recomputes the fact graph while reusing node ids, bumps the
-// generation and reconciles semantic states against accepted baselines. Writes
+// physical_revision and reconciles semantic states against accepted baselines. Writes
 // happen under the workspace lease; the fencing token is asserted before commit so a process
 // whose lease was taken over cannot commit even if it resumes.
 
@@ -22,13 +22,13 @@ import type { FactFile } from '../adapters/registry.js';
 import { diffManifest, type ManifestDiff } from './reconcile.js';
 import { computeImpact, type ImpactSet } from './impact.js';
 import { reconcileSemanticStatus } from '../semantic/baseline.js';
-import { chunkBytes, readBootstrapSource } from './bootstrap.js';
+import { startBootstrap } from './bootstrap.js';
 
 export type SyncMode = 'sync' | 'rebuild' | 'resume';
 
 export interface SyncResult {
   status: 'unchanged' | 'synced' | 'rebuilt' | 'resumed';
-  generation: number;
+  physical_revision: number;
   semanticRevision: number;
   added: number;
   changed: number;
@@ -42,7 +42,7 @@ const EMPTY_IMPACT: ImpactSet = { nodeIds: [], fileIds: [], clusterIds: [] };
 interface RebuildSnapshot {
   result: FactWriteResult;
   reuse: ReuseSnapshot;
-  generation: number;
+  physical_revision: number;
   semanticRevision: number;
 }
 
@@ -80,7 +80,7 @@ export async function syncWorkspace(env: BuildEnvironment, mode: SyncMode, verif
       // Reverting to previous content needs no rewrite and no semantic churn.
       return {
         status: 'unchanged',
-        generation: wsState.generation,
+        physical_revision: wsState.physical_revision,
         semanticRevision: wsState.semantic_revision,
         added: 0,
         changed: 0,
@@ -120,7 +120,7 @@ export async function syncWorkspace(env: BuildEnvironment, mode: SyncMode, verif
       assertLeaseValid(env.db, activeLease);
       const finalDiff = diffManifest(env.db, manifest);
       const committedState = readWorkspaceState(env.db)!;
-      if (staged && (committedState.generation !== staged.generation || committedState.semantic_revision !== staged.semanticRevision)) {
+      if (staged && (committedState.physical_revision !== staged.physical_revision || committedState.semantic_revision !== staged.semanticRevision)) {
         throw new BuildError('WORKTREE_BUSY', 'active index changed during rebuild; retry sync --rebuild', 5);
       }
       const reuse = staged?.reuse ?? captureReuseSnapshot(env.db);
@@ -134,7 +134,7 @@ export async function syncWorkspace(env: BuildEnvironment, mode: SyncMode, verif
         replacePaths,
       });
 
-      const newGeneration = committedState.generation + 1;
+      const newPhysicalRevision = committedState.physical_revision + 1;
       const impact = computeImpact(env.db, result.invalidatedFiles, result.invalidatedNodes);
       for (const removed of finalDiff.removed) {
         const cluster = reuse.clusterIdByPath.get(removed.path);
@@ -155,7 +155,7 @@ export async function syncWorkspace(env: BuildEnvironment, mode: SyncMode, verif
         upsertWorkspaceState(env.db, {
           workspaceId: env.state.workspace_id,
           rootPath: env.root,
-          generation: newGeneration,
+          physical_revision: newPhysicalRevision,
           buildStatus: 'ready',
           manifestHash: manifest.manifestHash,
           configFingerprint: env.configFingerprint,
@@ -168,7 +168,7 @@ export async function syncWorkspace(env: BuildEnvironment, mode: SyncMode, verif
 
       return {
         status: isRebuild ? 'rebuilt' : 'synced',
-        generation: newGeneration,
+        physical_revision: newPhysicalRevision,
         semanticRevision: committedState.semantic_revision,
         added: finalDiff.added.length,
         changed: finalDiff.changed.length,
@@ -246,7 +246,7 @@ function stageRebuild(
     if (!existsSync(verifiedPath)) throw new BuildError('REBUILD_INVALID', 'staging database disappeared', 4);
     db.run('ATTACH DATABASE ? AS rebuilt', verifiedPath);
     try {
-      return commit({ result, reuse, generation: version.generation, semanticRevision: version.semantic_revision });
+      return commit({ result, reuse, physical_revision: version.physical_revision, semanticRevision: version.semantic_revision });
     } finally {
       db.db.exec('DETACH DATABASE rebuilt');
     }
@@ -283,108 +283,25 @@ function affectedPaths(db: Database, diff: ManifestDiff, facts: FactFile[], reus
   return paths;
 }
 
-/**
- * Resume an incomplete initial build: re-validate the manifest against the staged snapshot,
- * re-chunk files whose content changed, drop removed files and refresh facts. Does not publish.
- */
+/** Refresh the unpublished facts and issue one new task; an old result keeps its old base. */
 async function resumeBootstrap(env: BuildEnvironment, lease: LeaseHandle): Promise<SyncResult> {
-  const bootstrap = env.db.get<{ bootstrap_id: string; manifest_hash: string; config_fingerprint: string | null; adapter_fingerprint: string | null }>(
-    'SELECT bootstrap_id, manifest_hash, config_fingerprint, adapter_fingerprint FROM bootstrap_state LIMIT 1',
-  );
-  if (!bootstrap) throw new BuildError('NO_BOOTSTRAP', 'no incomplete build to resume; run init', 3);
-  if (bootstrap.config_fingerprint && bootstrap.config_fingerprint !== env.configFingerprint) {
-    throw new BuildError('CONFIG_CHANGED', 'config changed since the build started; re-run init', 3);
-  }
-  if (bootstrap.adapter_fingerprint && bootstrap.adapter_fingerprint !== env.adapterFingerprint) {
-    throw new BuildError('ADAPTER_CHANGED', 'adapter version changed since the build started; re-run init', 3);
-  }
-
+  const version = readWorkspaceState(env.db)!;
+  if (version.build_status !== 'building') throw new BuildError('NO_BOOTSTRAP', 'no incomplete initial build; run init', 3);
   const manifest = discover(env.root, env.config);
-  if (manifest.files.length === 0) throw new BuildError('NO_SOURCE_FILES', 'no included source files found', 3);
-  const factFiles = await parseManifest(env.root, manifest.files, env.registry, findTsConfig(env.root));
-  if (discover(env.root, env.config).manifestHash !== manifest.manifestHash) {
-    throw new BuildError('WORKTREE_BUSY', 'source changed during resume; retry sync --resume', 5);
-  }
-
+  if (!manifest.files.length) throw new BuildError('NO_SOURCE_FILES', 'no included source files found', 3);
+  const diff = diffManifest(env.db, manifest);
+  const reuse = captureReuseSnapshot(env.db);
+  const facts = await parseManifest(env.root, manifest.files, env.registry, findTsConfig(env.root));
+  if (discover(env.root, env.config).manifestHash !== manifest.manifestHash) throw new BuildError('WORKTREE_BUSY', 'source changed during resume; retry', 5);
   return env.db.transaction(() => {
     assertLeaseValid(env.db, lease);
-    const active = env.db.get<{ bootstrap_id: string }>('SELECT bootstrap_id FROM bootstrap_state LIMIT 1');
-    if (active?.bootstrap_id !== bootstrap.bootstrap_id) throw new BuildError('WORKTREE_BUSY', 'the initial build changed during resume', 5);
-    // Re-validate staged chunks against current content; re-chunk changed files.
-    const staged = new Map<string, string>();
-    for (const r of env.db.all<{ path: string; file_hash: string }>('SELECT path, file_hash FROM bootstrap_manifest')) {
-      staged.set(r.path, r.file_hash);
-    }
-    const currentPaths = new Set(manifest.files.map((f) => f.path));
-    env.db.transaction(() => {
-      for (const f of manifest.files) {
-        const prevHash = staged.get(f.path);
-        if (prevHash === f.fileHash) continue;
-        // New or changed: reset chunks and draft so the Agent re-reads it.
-        env.db.run('DELETE FROM bootstrap_chunks WHERE path = ?', f.path);
-        env.db.run('DELETE FROM bootstrap_file_drafts WHERE path = ?', f.path);
-        env.db.run('DELETE FROM bootstrap_assignments WHERE path = ?', f.path);
-        const bytes = readBootstrapSource(env.root, f.path, f.fileHash);
-        const chunks = chunkBytes(bytes);
-        let idx = 0;
-        for (const c of chunks) {
-          env.db.run(
-            'INSERT INTO bootstrap_chunks (chunk_id, path, file_hash, start_byte, end_byte, start_line, received) VALUES (?, ?, ?, ?, ?, ?, 0)',
-            `${f.path}#${idx++}`,
-            f.path,
-            f.fileHash,
-            c.startByte,
-            c.endByte,
-            c.startLine,
-          );
-        }
-        const existing = env.db.get<{ path: string }>('SELECT path FROM bootstrap_manifest WHERE path = ?', f.path);
-        if (existing) env.db.run('UPDATE bootstrap_manifest SET file_hash = ?, byte_size = ?, language = ? WHERE path = ?', f.fileHash, f.byteSize, f.language, f.path);
-        else env.db.run('INSERT INTO bootstrap_manifest (path, file_hash, language, byte_size) VALUES (?, ?, ?, ?)', f.path, f.fileHash, f.language, f.byteSize);
-      }
-      // Drop removed files from staging.
-      for (const path of staged.keys()) {
-        if (!currentPaths.has(path)) {
-          env.db.run('DELETE FROM bootstrap_chunks WHERE path = ?', path);
-          env.db.run('DELETE FROM bootstrap_file_drafts WHERE path = ?', path);
-          env.db.run('DELETE FROM bootstrap_assignments WHERE path = ?', path);
-          env.db.run('DELETE FROM bootstrap_manifest WHERE path = ?', path);
-        }
-      }
-      if (bootstrap.manifest_hash !== manifest.manifestHash) {
-        env.db.run("DELETE FROM meta WHERE key LIKE 'bootstrap-batch:%'");
-        env.db.run("UPDATE bootstrap_state SET phase = 'read', manifest_hash = ?, updated_at = ? WHERE bootstrap_id = ?", manifest.manifestHash, Date.now(), bootstrap.bootstrap_id);
-        env.db.run('DELETE FROM bootstrap_cluster_drafts WHERE key NOT IN (SELECT cluster_key FROM bootstrap_assignments)');
-      }
-    });
-
-    // Refresh facts so highlight resolution at publish uses current nodes.
-    writeFacts(env.db, {
-      workspaceId: env.state.workspace_id,
-      manifestFiles: manifest.files,
-      factFiles,
-      registry: env.registry,
-    });
-    upsertWorkspaceState(env.db, {
-      workspaceId: env.state.workspace_id,
-      rootPath: env.root,
-      buildStatus: 'building',
-      manifestHash: manifest.manifestHash,
-      configFingerprint: env.configFingerprint,
-      adapterFingerprint: env.adapterFingerprint,
-    });
+    if (readWorkspaceState(env.db)?.build_status !== 'building') throw new BuildError('WORKTREE_BUSY', 'the initial build was published', 5);
+    writeFacts(env.db, { workspaceId: env.state.workspace_id, manifestFiles: manifest.files, factFiles: facts, registry: env.registry, reuse });
+    upsertWorkspaceState(env.db, { workspaceId: env.state.workspace_id, rootPath: env.root, buildStatus: 'building',
+      manifestHash: manifest.manifestHash, configFingerprint: env.configFingerprint, adapterFingerprint: env.adapterFingerprint });
     storeParserContext(env.db, manifest);
-
-    const ws = readWorkspaceState(env.db)!;
-    return {
-      status: 'resumed',
-      generation: ws.generation,
-      semanticRevision: ws.semantic_revision,
-      added: 0,
-      changed: 0,
-      removed: 0,
-      impact: EMPTY_IMPACT,
-      workItems: 0,
-    };
+    startBootstrap(env.db);
+    return { status: 'resumed', physical_revision: 0, semanticRevision: 0, added: diff.added.length, changed: diff.changed.length,
+      removed: diff.removed.length, impact: EMPTY_IMPACT, workItems: 0 };
   });
 }
