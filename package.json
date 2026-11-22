@@ -1,0 +1,42 @@
+{
+  "name": "code-map",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Code navigation plugin for coding agents: cluster/file/highlight semantics with source-backed relations and static paths.",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "bin": {
+    "codemap": "dist/cli.mjs"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/postbuild.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run build",
+    "test": "node --test tests/unit/*.test.mjs tests/integration/*.test.mjs",
+    "pretest:integration": "npm run build",
+    "test:integration": "node --test tests/integration/*.test.mjs",
+    "pretest:mcp": "npm run build",
+    "test:mcp": "node --test tests/mcp/*.test.mjs",
+    "pretest:lifecycle": "npm run build",
+    "test:lifecycle": "node --test tests/lifecycle/*.test.mjs",
+    "pretest:hooks": "npm run build",
+    "test:hooks": "node --test tests/hooks/*.test.mjs",
+    "validate:plugin": "node scripts/validate-plugin.mjs",
+    "pack:plugin": "node scripts/pack-plugin.mjs",
+    "bench:index": "node scripts/bench-index.mjs",
+    "bench:agent": "node scripts/bench-agent.mjs"
+  },
+  "dependencies": {
+    "ignore": "7.0.14",
+    "typescript": "5.9.3",
+    "web-tree-sitter": "0.25.10",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@types/node": "24.9.2",
+    "tree-sitter-python": "0.25.0"
+  }
+}

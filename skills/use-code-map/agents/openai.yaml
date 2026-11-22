@@ -1,0 +1,3 @@
+interface:
+  display_name: "Use Code Map"
+  short_description: "Query the code map and keep its semantics reviewed after edits."

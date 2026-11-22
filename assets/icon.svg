@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="Code Map">
+  <rect width="128" height="128" rx="24" fill="#0F172A"/>
+  <g stroke="#38BDF8" stroke-width="4" fill="none" stroke-linecap="round">
+    <path d="M40 44h20M76 44h12M40 64h12M68 64h20M40 84h28"/>
+  </g>
+  <g fill="#38BDF8">
+    <circle cx="34" cy="44" r="5"/>
+    <circle cx="34" cy="64" r="5"/>
+    <circle cx="34" cy="84" r="5"/>
+  </g>
+  <g fill="#F472B6">
+    <circle cx="94" cy="44" r="6"/>
+    <circle cx="94" cy="84" r="6"/>
+  </g>
+  <path d="M64 30v68" stroke="#475569" stroke-width="3" stroke-dasharray="6 6"/>
+</svg>
