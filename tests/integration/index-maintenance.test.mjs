@@ -1,17 +1,69 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { buildPublishedWorkspace, runCli } from '../helpers/workspace.mjs';
 import { queryCommands } from '../../dist/query/commands.js';
 import { openBuildEnvironment } from '../../dist/index/build.js';
 import { acquireLease, releaseLease } from '../../dist/storage/lease.js';
+import { DEFAULT_ADAPTER_FINGERPRINT } from '../../dist/adapters/versions.js';
 
 function version(root) {
   const db = new DatabaseSync(join(root, '.codemap', 'index.sqlite'), { readOnly: true });
   try { return db.prepare('SELECT physical_revision, semantic_revision FROM workspace_state').get(); } finally { db.close(); }
 }
+
+test('default queries refresh pre-fix Python facts without source edits and restore submodule call evidence', async (t) => {
+  const ws = buildPublishedWorkspace((root) => {
+    mkdirSync(join(root, 'extractors'));
+    writeFileSync(join(root, 'extractors/__init__.py'), '');
+    writeFileSync(join(root, 'extractors/vlm_extractor.py'), 'def extract_vlm():\n    pass\n');
+    writeFileSync(join(root, 'replay.py'), [
+      'from extractors import vlm_extractor',
+      'def run_stage(stage):',
+      '    vlm_extractor.extract_vlm()',
+      '    target = getattr(vlm_extractor, stage)',
+      '    target()',
+      '',
+    ].join('\n'));
+  });
+  t.after(ws.cleanup);
+  const before = await queryCommands.map_inspect_node({ root: ws.root, query: 'run_stage' });
+  const target = await queryCommands.map_inspect_node({ root: ws.root, query: 'extract_vlm' });
+  const callerId = before.focus.node_id;
+  const targetId = target.focus.node_id;
+  // Recreate the persisted 1.1.0 omission while keeping every source byte unchanged.
+  const db = new DatabaseSync(join(ws.root, '.codemap', 'index.sqlite'));
+  try {
+    db.prepare("DELETE FROM edges WHERE from_node_id = ? AND to_node_id = ? AND relation_type = 'CALLS'").run(callerId, targetId);
+    db.prepare('UPDATE workspace_state SET adapter_fingerprint = ?').run('python@1.1.0,typescript@1.1.0');
+  } finally { db.close(); }
+  await assert.rejects(queryCommands.map_inspect_node({ root: ws.root, target_id: callerId, freshness_mode: 'verify' }), { code: 'INDEX_STALE' });
+  const refreshed = runCli(['query', 'map_inspect_node', '--root', ws.root, '--input', '-'], {
+    input: JSON.stringify({ target_id: callerId }),
+  });
+  assert.equal(refreshed.code, 0, refreshed.stdout + refreshed.stderr);
+  const current = refreshed.json;
+  assert.equal(current.physical_index.physical_revision, 2);
+  assert.equal(current.semantic_revision, before.semantic_revision);
+  assert.equal(current.focus.node_id, callerId);
+  assert.equal(current.focus.semantics.purpose, before.focus.semantics.purpose);
+  const edges = current.focus.out_edges.filter((edge) => edge.relation_type === 'CALLS' && edge.other_node_id === targetId);
+  assert.equal(edges.length, 1);
+  assert.equal(edges[0].evidence.path, 'replay.py');
+  assert.equal(edges[0].evidence.start_line, 3);
+  const incoming = await queryCommands.map_inspect_node({ root: ws.root, target_id: targetId });
+  assert.ok(incoming.focus.in_edges.some((edge) => edge.other_node_id === callerId && edge.evidence.start_line === 3));
+  const trace = await queryCommands.map_trace_node_paths({ root: ws.root, target_id: callerId });
+  assert.ok(trace.nodes.some((node) => node.node_id === targetId));
+  const stored = new DatabaseSync(join(ws.root, '.codemap', 'index.sqlite'), { readOnly: true });
+  try {
+    assert.equal(stored.prepare('SELECT adapter_fingerprint FROM workspace_state').get().adapter_fingerprint, DEFAULT_ADAPTER_FINGERPRINT);
+    assert.ok(stored.prepare("SELECT 1 FROM diagnostics WHERE node_id = ? AND code = 'UNRESOLVED_CALLEE' AND message = 'target'").get(callerId));
+  } finally { stored.close(); }
+  assert.equal((await queryCommands.map_overview({ root: ws.root })).physical_index.physical_revision, 2);
+});
 
 test('default shared queries synchronize edits, additions, deletions and facts outside the requested scope', async (t) => {
   const ws = buildPublishedWorkspace(); t.after(ws.cleanup);
