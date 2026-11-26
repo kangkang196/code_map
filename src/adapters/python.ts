@@ -96,6 +96,7 @@ interface PyFileCtx {
   seq: number;
   diagnostics: FactDiagnostic[];
   edges: FactEdge[];
+  moduleScopes: Map<string, Scope>;
 }
 
 function loc(ctx: PyFileCtx, node: SyntaxNode, kind: FactLocation['kind']): FactLocation {
@@ -141,6 +142,7 @@ export class PythonAdapter implements LanguageAdapter {
     const available = new Set<string>(pyFiles.map((f) => f.path));
     const contexts = new Map<string, PyFileCtx>();
     const declIndex = new Map<string, Map<string, string>>();
+    const moduleScopes = new Map<string, Scope>();
 
     // Pass 1: parse and collect declarations, regions and the cross-file declaration index.
     for (const f of pyFiles) {
@@ -163,6 +165,7 @@ export class PythonAdapter implements LanguageAdapter {
           seq: 0,
           diagnostics: [],
           edges: [],
+          moduleScopes,
         };
         void raw;
         contexts.set(f.path, ctx);
@@ -180,7 +183,14 @@ export class PythonAdapter implements LanguageAdapter {
       }
     }
 
-    // Pass 2: resolve imports and calls with the complete declaration index.
+    // Collect package bindings first so submodule fallback cannot override a package member.
+    for (const [path, ctx] of contexts) {
+      const scope = newScope(null);
+      collectScopeBindings(ctx, ctx.root, scope, path, declIndex, available);
+      moduleScopes.set(path, scope);
+    }
+
+    // Pass 2: resolve imports and calls with complete declaration and package binding indexes.
     const symbols = new Map<string, string>();
     for (const [path, ctx] of contexts) {
       for (const decl of ctx.declarations) symbols.set(`${path}\0${decl.localId}`, decl.symbolKey);
@@ -416,7 +426,6 @@ function bindImportFromStatement(
   declIndex: Map<string, Map<string, string>>,
   available: Set<string>,
 ): void {
-  void ctx;
   // Determine module dotted name and relative level.
   let moduleDotted = '';
   let level = 0;
@@ -434,19 +443,23 @@ function bindImportFromStatement(
   const modulePath = resolveModule(available, path, moduleDotted, level);
   for (const c of node.namedChildren) {
     if (!c) continue;
-    if (c === moduleNode) continue;
-    if (c.type === 'dotted_name') {
-      const name = c.text;
-      const local = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : name;
-      bindName(scope, local, { kind: 'import', modulePath, qualifiedName: name, alias: local, isModuleAlias: false });
-    } else if (c.type === 'aliased_import') {
-      const nameNode = child(c, 'name');
-      const aliasNode = child(c, 'alias');
-      if (!nameNode) continue;
-      const name = nameNode.text;
-      const local = aliasNode ? aliasNode.text : name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : name;
-      bindName(scope, local, { kind: 'import', modulePath, qualifiedName: name, alias: local, isModuleAlias: false });
-    }
+    if (c.id === moduleNode?.id) continue;
+    if (c.type !== 'dotted_name' && c.type !== 'aliased_import') continue;
+    const nameNode = c.type === 'aliased_import' ? child(c, 'name') : c;
+    const aliasNode = c.type === 'aliased_import' ? child(c, 'alias') : null;
+    if (!nameNode) continue;
+    const name = nameNode.text;
+    const local = aliasNode ? aliasNode.text : name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : name;
+    // Python checks existing package attributes before loading a child module. Preserve
+    // symbol imports unless the package binding already identifies this exact child module.
+    const submodulePath = (!modulePath || modulePath.endsWith('/__init__.py'))
+      ? resolveModule(available, path, moduleDotted ? `${moduleDotted}.${name}` : name, level)
+      : null;
+    const member = ctx.moduleScopes.get(modulePath ?? '')?.bindings.get(name);
+    const isSameModule = member?.kind === 'import' && member.isModuleAlias && member.modulePath === submodulePath;
+    bindName(scope, local, submodulePath && (!member || isSameModule)
+      ? { kind: 'import', modulePath: submodulePath, qualifiedName: null, alias: local, isModuleAlias: true }
+      : { kind: 'import', modulePath, qualifiedName: name, alias: local, isModuleAlias: false });
   }
   void declIndex;
 }

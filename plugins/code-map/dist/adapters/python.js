@@ -97,6 +97,7 @@ export class PythonAdapter {
         const available = new Set(pyFiles.map((f) => f.path));
         const contexts = new Map();
         const declIndex = new Map();
+        const moduleScopes = new Map();
         // Pass 1: parse and collect declarations, regions and the cross-file declaration index.
         for (const f of pyFiles) {
             let raw;
@@ -119,6 +120,7 @@ export class PythonAdapter {
                     seq: 0,
                     diagnostics: [],
                     edges: [],
+                    moduleScopes,
                 };
                 void raw;
                 contexts.set(f.path, ctx);
@@ -136,7 +138,13 @@ export class PythonAdapter {
                 });
             }
         }
-        // Pass 2: resolve imports and calls with the complete declaration index.
+        // Collect package bindings first so submodule fallback cannot override a package member.
+        for (const [path, ctx] of contexts) {
+            const scope = newScope(null);
+            collectScopeBindings(ctx, ctx.root, scope, path, declIndex, available);
+            moduleScopes.set(path, scope);
+        }
+        // Pass 2: resolve imports and calls with complete declaration and package binding indexes.
         const symbols = new Map();
         for (const [path, ctx] of contexts) {
             for (const decl of ctx.declarations)
@@ -355,7 +363,6 @@ function bindImportStatement(ctx, node, scope, path, declIndex, available) {
     void declIndex;
 }
 function bindImportFromStatement(ctx, node, scope, path, declIndex, available) {
-    void ctx;
     // Determine module dotted name and relative level.
     let moduleDotted = '';
     let level = 0;
@@ -375,22 +382,26 @@ function bindImportFromStatement(ctx, node, scope, path, declIndex, available) {
     for (const c of node.namedChildren) {
         if (!c)
             continue;
-        if (c === moduleNode)
+        if (c.id === moduleNode?.id)
             continue;
-        if (c.type === 'dotted_name') {
-            const name = c.text;
-            const local = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : name;
-            bindName(scope, local, { kind: 'import', modulePath, qualifiedName: name, alias: local, isModuleAlias: false });
-        }
-        else if (c.type === 'aliased_import') {
-            const nameNode = child(c, 'name');
-            const aliasNode = child(c, 'alias');
-            if (!nameNode)
-                continue;
-            const name = nameNode.text;
-            const local = aliasNode ? aliasNode.text : name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : name;
-            bindName(scope, local, { kind: 'import', modulePath, qualifiedName: name, alias: local, isModuleAlias: false });
-        }
+        if (c.type !== 'dotted_name' && c.type !== 'aliased_import')
+            continue;
+        const nameNode = c.type === 'aliased_import' ? child(c, 'name') : c;
+        const aliasNode = c.type === 'aliased_import' ? child(c, 'alias') : null;
+        if (!nameNode)
+            continue;
+        const name = nameNode.text;
+        const local = aliasNode ? aliasNode.text : name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : name;
+        // Python checks existing package attributes before loading a child module. Preserve
+        // symbol imports unless the package binding already identifies this exact child module.
+        const submodulePath = (!modulePath || modulePath.endsWith('/__init__.py'))
+            ? resolveModule(available, path, moduleDotted ? `${moduleDotted}.${name}` : name, level)
+            : null;
+        const member = ctx.moduleScopes.get(modulePath ?? '')?.bindings.get(name);
+        const isSameModule = member?.kind === 'import' && member.isModuleAlias && member.modulePath === submodulePath;
+        bindName(scope, local, submodulePath && (!member || isSameModule)
+            ? { kind: 'import', modulePath: submodulePath, qualifiedName: null, alias: local, isModuleAlias: true }
+            : { kind: 'import', modulePath, qualifiedName: name, alias: local, isModuleAlias: false });
     }
     void declIndex;
 }

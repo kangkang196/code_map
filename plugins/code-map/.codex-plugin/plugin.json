@@ -1,6 +1,6 @@
 {
   "name": "code-map",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Code navigation for coding agents: browse cluster/file/highlight semantics and trace source-backed static relations and multi-hop paths. TypeScript/JavaScript and Python; Windows first.",
   "author": {
     "name": "Code Map"
